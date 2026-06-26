@@ -1,0 +1,118 @@
+# contextbodies
+
+A physics-inspired token sampling system for LLMs that replaces temperature-based sampling with a gravitational field model.
+
+## Concept
+
+Standard LLM sampling uses **temperature** to flatten or sharpen a probability distribution uniformly across all tokens. `contextbodies` replaces this with **context gravity** — semantic clusters that emerge from the token stream and exert gravitational influence on sampling, analogous to celestial bodies in a gravitational field.
+
+### Context Bodies
+
+As tokens are generated, they cluster in embedding space. Dense clusters become **context bodies** — gravitational objects that pull candidate tokens toward semantically related output. The mass of a body determines its influence:
+
+| Body Type | Mass | Behavior |
+|---|---|---|
+| Black hole | Very high | Dominant, inescapable theme (e.g. system prompt constraints) |
+| Neutron star | High | Rare but highly specific, dense context |
+| Planet | Moderate | Stable topic with consistent influence |
+| Moon | Low | Sub-topic orbiting a parent body |
+| Asteroid | Very low | Passing mention, minimal pull |
+
+Body type is not assigned manually — it **emerges** from cluster density and model weight norms over time.
+
+### Gravitational Force
+
+The force a context body exerts on a candidate token follows Newton's law of gravitation:
+
+$$F = G \frac{m_{token} \cdot m_{body}}{r^2}$$
+
+Where:
+- **G** — gravitational constant (tunable, replaces temperature)
+- **m_token** — token mass, derived from model weight norms: `m = W / G`
+- **m_body** — body mass, derived from cluster density × weight norms
+- **r** — cosine distance between the token embedding and the body centroid
+
+### Orbital Mechanics
+
+The current context vector has **position**, **velocity**, and **acceleration** in embedding space:
+
+- **Velocity** — direction the context is trending semantically
+- **Acceleration** — rate of topic shift
+- **Momentum** — resistance to gravitational deflection from new bodies
+
+Tokens can orbit context bodies, transfer between them as topics shift, or achieve escape velocity to produce novel output.
+
+## Architecture
+
+```
+contextbodies/
+├── context_body.py          # ContextBody dataclass — mass, centroid, orbital membership
+├── context_body_store.py    # Persistent store — FAISS hot layer + cold vector DB
+├── orbital_state.py         # Position/velocity/acceleration of the context vector
+├── incremental_dbscan.py    # Online clustering — discovers emergent bodies token by token
+├── gravitational_sampler.py # Core sampler — replaces temperature at inference time
+└── generate.py              # Drop-in generation loop
+```
+
+## Usage
+
+```python
+from contextbodies import GravitationalSampler, ContextBodyStore
+from contextbodies.generate import generate
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("your-model")
+tokenizer = AutoTokenizer.from_pretrained("your-model")
+
+store = ContextBodyStore(embedding_dim=768)
+sampler = GravitationalSampler(
+    body_store=store,
+    G=1.0,                  # gravitational constant — primary tuning knob
+    escape_threshold=0.01,  # minimum force to influence sampling
+    domain="ml",            # domain for body persistence and retrieval
+)
+
+text = generate(
+    model=model,
+    tokenizer=tokenizer,
+    prompt="Tell me about transformers",
+    sampler=sampler,
+    max_tokens=200,
+)
+print(text)
+```
+
+## Key Parameters
+
+| Parameter | Description | Default |
+|---|---|---|
+| `G` | Gravitational constant. Higher = stronger context pull, less diversity | `1.0` |
+| `escape_threshold` | Minimum force magnitude to bias sampling. Tokens below this are unaffected | `0.01` |
+| `stability_threshold` | Minimum stability score for an emergent body to be persisted | `0.8` |
+| `domain` | Domain label for body storage and retrieval | `""` |
+
+## Body Persistence
+
+Stable emergent bodies are recorded to the `ContextBodyStore` and reused across conversations. This builds a **living knowledge graph** of domain-specific gravitational structure over time:
+
+- Bodies gain mass as related tokens accrete onto them
+- Bodies decay in mass when not reinforced by recent context
+- Bodies can merge (topic convergence) or fragment (topic divergence)
+- Historical bodies seed the gravitational field at the start of new conversations
+
+## Dependencies
+
+```
+torch
+numpy
+faiss-cpu  # or faiss-gpu
+```
+
+## Status
+
+Early research implementation. The following are not yet implemented and are good starting points for contribution:
+
+- Cold storage backend (Pinecone / Weaviate / pgvector integration)
+- Body mass refinement from model weight norms (currently uses cluster density only)
+- Orbital resonance detection between co-present bodies
+- Benchmarking against temperature / top-p baselines (perplexity, MAUVE, distinct-n)
