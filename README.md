@@ -42,18 +42,6 @@ The current context vector has **position**, **velocity**, and **acceleration** 
 
 Tokens can orbit context bodies, transfer between them as topics shift, or achieve escape velocity to produce novel output.
 
-## Architecture
-
-```
-contextbodies/
-├── context_body.py          # ContextBody dataclass — mass, centroid, orbital membership
-├── context_body_store.py    # Persistent store — FAISS hot layer + cold vector DB
-├── orbital_state.py         # Position/velocity/acceleration of the context vector
-├── incremental_dbscan.py    # Online clustering — discovers emergent bodies token by token
-├── gravitational_sampler.py # Core sampler — replaces temperature at inference time
-└── generate.py              # Drop-in generation loop
-```
-
 ## Usage
 
 ```python
@@ -100,13 +88,69 @@ Stable emergent bodies are recorded to the `ContextBodyStore` and reused across 
 - Bodies can merge (topic convergence) or fragment (topic divergence)
 - Historical bodies seed the gravitational field at the start of new conversations
 
+## Architecture
+
+```
+contextbodies/
+├── context_body.py          # ContextBody dataclass — mass, centroid, orbital membership
+├── context_body_store.py    # Persistent store — FAISS hot layer + cold vector DB
+├── orbital_state.py         # Position/velocity/acceleration of the context vector
+├── incremental_dbscan.py    # Online clustering — discovers emergent bodies token by token
+├── gravitational_sampler.py # Core sampler — replaces temperature at inference time
+├── generate.py              # Drop-in generation loop
+└── tests/
+    ├── conftest.py
+    └── test_fragmentation.py
+```
+
 ## Dependencies
 
 ```
 torch
 numpy
 faiss-cpu  # or faiss-gpu
+pytest     # for running tests
 ```
+
+Install all at once:
+
+```bash
+pip install torch numpy faiss-cpu pytest
+```
+
+## Testing
+
+Tests cover fragmentation and bimodality detection across all internal methods and the full `update()` pipeline.
+
+```bash
+cd contextbodies
+pytest tests/ -v
+```
+
+Run a specific test class:
+
+```bash
+pytest tests/test_fragmentation.py::TestCheckBimodality -v
+```
+
+Run with output for debugging:
+
+```bash
+pytest tests/ -v -s
+```
+
+### What's tested
+
+| Class | What it covers |
+|---|---|
+| `TestFirstPrincipalComponent` | Power iteration correctness, unit norm, determinism |
+| `TestHasValley` | Clear bimodal, unimodal, uniform, strict threshold, flat histogram |
+| `TestCheckBimodality` | Bimodal detected, unimodal rejected, size gate, elongation gate |
+| `TestSplitBimodal` | Two clusters produced, original removed, no overlap, lineage, abort guard |
+| `TestConnectedComponents` | Disconnected groups, full partition, tight cluster, border-only cluster |
+| `TestFragmentCluster` | Cluster count, label removal, point relabeling, centroid history inherited |
+| `TestMaybeFragment` | Stable skip, missing label, connectivity priority, bimodality fallback |
+| `TestUpdateIntegration` | New body events, merge events, fragmentation events, noise, single cluster |
 
 ## Status
 
