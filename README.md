@@ -154,9 +154,28 @@ pytest tests/ -v -s
 
 ## Status
 
-Early research implementation. The following are not yet implemented and are good starting points for contribution:
+Early research implementation. Open issues are grouped below by area.
 
-- Cold storage backend (Pinecone / Weaviate / pgvector integration)
-- Body mass refinement from model weight norms (currently uses cluster density only)
-- Orbital resonance detection between co-present bodies
-- Benchmarking against temperature / top-p baselines (perplexity, MAUVE, distinct-n)
+### Storage & Persistence
+- Cold storage backend — `ContextBodyStore` has a hot FAISS layer but no cold persistence. Needs integration with a vector database (Pinecone, Weaviate, or pgvector) for cross-session body reuse
+- Decay scheduler — `ContextBodyStore.decay()` exists but nothing calls it automatically; needs a background process or per-query trigger
+
+### Physics Model
+- Body mass refinement — mass currently equals cluster density only; model weight norms are not yet factored in despite being defined in the formula (`m = W / G`)
+- Orbital resonance detection — co-present bodies that periodically reinforce each other's influence are not detected or exploited
+- Domain classifier — domain is passed manually at construction time; no mechanism exists to infer it from the token stream
+
+### Clustering
+- Merge sync fragility — `GravitationalSampler._update_clustering` removes absorbed bodies using a heuristic; should use the clean label-based approach consistently
+- Border-point bridge case — connectivity fragmentation BFS only walks core points; a cluster bridged solely through border points will not fragment via the structural check (bimodality may still catch it)
+
+### Evaluation
+- Benchmarking — no evaluation harness against temperature / top-p baselines; suggested metrics: perplexity, MAUVE, distinct-n, KL divergence from baseline distribution
+
+### Testing
+- `GravitationalSampler` has no tests — force computation, escape threshold, orbital state updates, and active body sync all need coverage
+- `ContextBodyStore` has no tests — query, record, merge, fragment, and decay operations are untested
+- `OrbitalState` has no tests — position, velocity, and acceleration update logic is untested
+
+### Documentation
+- White paper — formal writeup of the methodology, theoretical grounding, and thesis; should cover the physics analogy, the gravitational sampling formula, emergent body detection, orbital mechanics, and comparison to existing sampling strategies
