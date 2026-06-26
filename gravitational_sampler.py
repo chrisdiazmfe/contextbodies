@@ -49,7 +49,8 @@ class GravitationalSampler:
         self.device = device
 
         self.orbital_state: OrbitalState | None = None
-        self.active_bodies: list[tuple[ContextBody, float]] = []
+        # (cluster_label, body, distance) — label=-1 for store-loaded bodies
+        self.active_bodies: list[tuple[int, ContextBody, float]] = []
         self.clustering: IncrementalDBSCAN | None = None
 
     # ------------------------------------------------------------------
@@ -80,12 +81,15 @@ class GravitationalSampler:
             emb = context_embeddings[i].cpu().numpy()
             self.clustering.update(token_id=-i, embedding=emb)
 
-        # load relevant recorded bodies from the store
-        self.active_bodies = self.body_store.query_nearby(
-            embedding=initial_pos,
-            domain=self.domain,
-            k=20,
-        )
+        # load relevant recorded bodies from the store (label=-1 = store-sourced)
+        self.active_bodies = [
+            (-1, body, dist)
+            for body, dist in self.body_store.query_nearby(
+                embedding=initial_pos,
+                domain=self.domain,
+                k=20,
+            )
+        ]
 
     # ------------------------------------------------------------------
     # Force computation
@@ -160,7 +164,7 @@ class GravitationalSampler:
             token_mass = self._compute_token_mass(token_id, weight_matrix)
 
             total_force = np.zeros_like(token_emb)
-            for body, _ in self.active_bodies:
+            for _, body, _ in self.active_bodies:
                 total_force += self._gravitational_force(token_emb, token_mass, body)
 
             force_magnitude = float(np.linalg.norm(total_force))
@@ -191,12 +195,51 @@ class GravitationalSampler:
     def _update_clustering(self, token_id: int, embedding: np.ndarray) -> None:
         """
         Incrementally update DBSCAN clustering with the newly sampled token.
-        Records stable emergent bodies to the store and adds them to active_bodies.
-        """
-        new_bodies, merged, fragmented = self.clustering.update(token_id, embedding)
+        Keeps active_bodies in sync by tracking cluster labels alongside bodies.
 
+        Three events to handle:
+            new_bodies        — append with their cluster label
+            merged_events     — remove absorbed labels; surviving label stays
+            fragmented_events — remove old label; append new fragment labels
+        """
+        new_bodies, merged_events, fragmented_events = self.clustering.update(
+            token_id, embedding
+        )
+
+        # new cluster formed — append
         for body in new_bodies:
             body.domain = self.domain
+            label = next(
+                (lbl for lbl in self.clustering.clusters
+                 if body.member_tokens <= self.clustering.clusters[lbl]),
+                -1,
+            )
             if body.stability >= self.stability_threshold:
                 self.body_store.record(body)
-            self.active_bodies.append((body, 0.0))
+            self.active_bodies.append((label, body, 0.0))
+
+        # merge — remove absorbed labels (surviving label's body centroid
+        # was updated in-place so it remains correct in active_bodies)
+        if merged_events:
+            absorbed = {old for old, _ in merged_events}
+            self.active_bodies = [
+                (lbl, b, d) for lbl, b, d in self.active_bodies
+                if lbl not in absorbed
+            ]
+
+        # fragmentation — remove old label, add fragment bodies
+        for old_label, frag_bodies in fragmented_events:
+            self.active_bodies = [
+                (lbl, b, d) for lbl, b, d in self.active_bodies
+                if lbl != old_label
+            ]
+            for frag_body in frag_bodies:
+                frag_body.domain = self.domain
+                frag_label = next(
+                    (lbl for lbl in self.clustering.clusters
+                     if frag_body.member_tokens <= self.clustering.clusters[lbl]),
+                    -1,
+                )
+                if frag_body.stability >= self.stability_threshold:
+                    self.body_store.record(frag_body)
+                self.active_bodies.append((frag_label, frag_body, 0.0))
