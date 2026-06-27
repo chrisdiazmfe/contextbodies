@@ -5,9 +5,14 @@ import torch
 import torch.nn.functional as F
 
 from context_body import ContextBody
+from context_body_record import ContextBodyRecord
 from context_body_store import ContextBodyStore
 from incremental_dbscan import IncrementalDBSCAN
 from orbital_state import OrbitalState
+
+# Both ContextBody and ContextBodyRecord have .centroid and .mass,
+# so force computation works on either without a union type.
+_GravitySource = ContextBody | ContextBodyRecord
 
 
 class GravitationalSampler:
@@ -49,8 +54,10 @@ class GravitationalSampler:
         self.device = device
 
         self.orbital_state: OrbitalState | None = None
-        # (cluster_label, body, distance) — label=-1 for store-loaded bodies
-        self.active_bodies: list[tuple[int, ContextBody, float]] = []
+        # (cluster_label, body, distance)
+        # label=-1 for store-loaded ContextBodyRecord objects
+        # label>=0 for emergent ContextBody objects from IncrementalDBSCAN
+        self.active_bodies: list[tuple[int, _GravitySource, float]] = []
         self.clustering: IncrementalDBSCAN | None = None
 
     # ------------------------------------------------------------------
@@ -81,10 +88,12 @@ class GravitationalSampler:
             emb = context_embeddings[i].cpu().numpy()
             self.clustering.update(token_id=-i, embedding=emb)
 
-        # load relevant recorded bodies from the store (label=-1 = store-sourced)
+        # load relevant recorded bodies from the store
+        # query_nearby returns ContextBodyRecord objects — label=-1 marks them
+        # as store-sourced so _update_clustering doesn't try to remove them
         self.active_bodies = [
-            (-1, body, dist)
-            for body, dist in self.body_store.query_nearby(
+            (-1, record, dist)
+            for record, dist in self.body_store.query_nearby(
                 embedding=initial_pos,
                 domain=self.domain,
                 k=20,
@@ -215,7 +224,13 @@ class GravitationalSampler:
                 -1,
             )
             if body.stability >= self.stability_threshold:
-                self.body_store.record(body)
+                # persist centroid + scalars only — no relational data
+                self.body_store.record(
+                    centroid=body.centroid,
+                    mass=body.mass,
+                    stability=body.stability,
+                    domain=body.domain,
+                )
             self.active_bodies.append((label, body, 0.0))
 
         # merge — remove absorbed labels (surviving label's body centroid
@@ -241,5 +256,10 @@ class GravitationalSampler:
                     -1,
                 )
                 if frag_body.stability >= self.stability_threshold:
-                    self.body_store.record(frag_body)
+                    self.body_store.record(
+                        centroid=frag_body.centroid,
+                        mass=frag_body.mass,
+                        stability=frag_body.stability,
+                        domain=frag_body.domain,
+                    )
                 self.active_bodies.append((frag_label, frag_body, 0.0))

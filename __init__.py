@@ -6,11 +6,14 @@ field model. Semantic clusters (context bodies) emerge from the token stream
 and exert gravitational influence on the sampling distribution.
 
 Core concepts:
-    ContextBody         — a gravitational body in embedding space (black hole,
-                          planet, moon, asteroid, etc.) with mass, centroid,
-                          velocity, and orbital membership.
-    ContextBodyStore    — persistent store for recorded bodies; two-layer
-                          hot (FAISS) + cold (vector DB) architecture.
+    ContextBody         — ephemeral in-memory body used during a conversation
+                          for clustering and force computation. Never persisted.
+    ContextBodyRecord   — lightweight persistent record stored in the vector DB.
+                          Centroid + scalar metadata only. No relational fields.
+    ContextBodyStore    — thin wrapper around a VectorBackend. Three operations:
+                          record(), query_nearby(), decay().
+    VectorBackend       — protocol for swappable storage backends.
+    FAISSBackend        — default in-memory backend using FAISS IndexIDMap.
     OrbitalState        — tracks position, velocity, and acceleration of the
                           current context vector through embedding space.
     IncrementalDBSCAN   — online clustering that discovers emergent context
@@ -27,18 +30,29 @@ Quickstart:
 
     text = generate(model, tokenizer, prompt="Tell me about transformers",
                     sampler=sampler, max_tokens=200)
+
+Swapping to a production vector DB:
+    from contextbodies import ContextBodyStore
+    from my_backends import QdrantBackend
+
+    store = ContextBodyStore(embedding_dim=768, backend=QdrantBackend(...))
 """
 
 from context_body import ContextBody
+from context_body_record import ContextBodyRecord
 from context_body_store import ContextBodyStore
 from gravitational_sampler import GravitationalSampler
 from incremental_dbscan import IncrementalDBSCAN
 from orbital_state import OrbitalState
+from vector_backend import VectorBackend, FAISSBackend
 
 __all__ = [
     "ContextBody",
+    "ContextBodyRecord",
     "ContextBodyStore",
+    "FAISSBackend",
     "GravitationalSampler",
     "IncrementalDBSCAN",
     "OrbitalState",
+    "VectorBackend",
 ]

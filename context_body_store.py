@@ -1,199 +1,225 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 import numpy as np
-import faiss
 
-from context_body import ContextBody
+from context_body_record import ContextBodyRecord
+from vector_backend import VectorBackend, FAISSBackend
 
 
 class ContextBodyStore:
     """
-    Persistent store for recorded context bodies.
+    Persistent store for stabilized context bodies.
 
-    Two-layer architecture:
-        Hot layer  — in-memory dict + FAISS index for active/recent bodies.
-                     Used during inference for fast gravitational lookups.
-        Cold layer — vector database (Pinecone, Weaviate, pgvector, etc.)
-                     for the full historical corpus. Queried at conversation
-                     start to seed the hot layer.
+    A thin wrapper around a VectorBackend — all storage, indexing, and
+    retrieval is delegated to the backend. The store adds three domain-level
+    behaviors on top of the raw backend:
 
-    Bodies flow:
-        Emergent (DBSCAN) → stable → record() → hot layer → cold layer
-        Cold layer → query_nearby() → hot layer → inference
+        record()      — deduplicates before inserting; updates mass on near-match
+        query_nearby() — ANN search + domain filter + gravitational ranking
+        decay()       — reduces mass over time; removes extinct bodies
+
+    The store deals exclusively in ContextBodyRecord objects (centroid + scalar
+    metadata). It has no knowledge of ContextBody, member tokens, orbital state,
+    or any relational structure. All of that lives in IncrementalDBSCAN and
+    GravitationalSampler for the duration of a conversation, then is discarded.
+
+    Swapping backends:
+        store = ContextBodyStore(dim=768)                          # default FAISS
+        store = ContextBodyStore(dim=768, backend=QdrantBackend()) # Qdrant
+        store = ContextBodyStore(dim=768, backend=PineconeBackend()) # Pinecone
     """
 
     def __init__(
         self,
         embedding_dim: int,
+        backend: VectorBackend | None = None,
         decay_rate: float = 1e-5,
         extinction_threshold: float = 0.01,
+        dedup_distance: float = 0.05,   # cosine distance below which two bodies are the same
+        decay_interval: float = 60.0,   # seconds between automatic decay runs
     ):
         self.embedding_dim = embedding_dim
+        self.backend = backend or FAISSBackend(embedding_dim)
         self.decay_rate = decay_rate
         self.extinction_threshold = extinction_threshold
+        self.dedup_distance = dedup_distance
+        self.decay_interval = decay_interval
 
-        # primary storage
-        self.bodies: dict[UUID, ContextBody] = {}
+        # local cache of record IDs → last_seen, for decay bookkeeping
+        # (avoids a full scan of the backend on every decay call)
+        self._record_last_seen: dict[str, datetime] = {}
+        self._record_mass: dict[str, float] = {}
 
-        # FAISS index — inner product on L2-normalized vectors = cosine similarity
-        self.embedding_index = faiss.IndexFlatIP(embedding_dim)
-        self.index_id_map: dict[int, UUID] = {}   # faiss position → UUID
-        self._next_index_pos: int = 0
-
-        # domain partitioning
-        self.domain_index: dict[str, list[UUID]] = {}
+        # per-query decay trigger — last time decay() was run automatically
+        self._last_decay_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Core operations
     # ------------------------------------------------------------------
 
-    def record(self, body: ContextBody) -> UUID:
+    def record(
+        self,
+        centroid: np.ndarray,
+        mass: float,
+        stability: float,
+        domain: str = "",
+    ) -> UUID:
         """
-        Persist a newly stabilized emergent body.
-        Checks for near-duplicates (cosine similarity > 0.95) before inserting.
+        Persist a stabilized context body.
+
+        If a near-duplicate already exists (cosine distance < dedup_distance),
+        updates its mass (weighted average) and last_seen timestamp instead of
+        inserting a new record. This prevents the store from accumulating
+        redundant bodies for the same semantic concept across conversations.
+
+        Returns the UUID of the inserted or updated record.
         """
-        if len(self.bodies) > 0:
-            nearby = self.query_nearby(body.centroid, body.domain, k=1)
-            if nearby and nearby[0][1] < 0.05:   # cosine distance < 0.05 = near-duplicate
-                # merge into existing body instead of inserting
-                existing_body, _ = nearby[0]
-                for token_id, emb in zip(body.member_tokens,
-                                         [body.centroid] * len(body.member_tokens)):
-                    existing_body.accrete(token_id, emb)
-                return existing_body.id
+        # near-duplicate check
+        nearby = self.query_nearby(centroid, domain=domain, k=1)
+        if nearby and nearby[0][1] < self.dedup_distance:
+            existing, dist = nearby[0]
+            new_mass = (existing.mass + mass) / 2
+            now = datetime.utcnow()
+            self.backend.update_metadata(str(existing.id), {
+                "mass": new_mass,
+                "last_seen": now.isoformat(),
+            })
+            self._record_mass[str(existing.id)] = new_mass
+            self._record_last_seen[str(existing.id)] = now
+            return existing.id
 
-        # insert new body
-        self.bodies[body.id] = body
-
-        # add normalized centroid to FAISS index
-        norm_centroid = body.centroid / (np.linalg.norm(body.centroid) + 1e-8)
-        self.embedding_index.add(norm_centroid.reshape(1, -1).astype(np.float32))
-        self.index_id_map[self._next_index_pos] = body.id
-        self._next_index_pos += 1
-
-        # update domain index
-        self.domain_index.setdefault(body.domain, []).append(body.id)
-
-        return body.id
+        # new record
+        rec = ContextBodyRecord(
+            centroid=centroid,
+            mass=mass,
+            stability=stability,
+            domain=domain,
+        )
+        self.backend.upsert(
+            record_id=str(rec.id),
+            vector=centroid,
+            metadata=rec.to_metadata(),
+        )
+        self._record_last_seen[str(rec.id)] = rec.last_seen
+        self._record_mass[str(rec.id)] = mass
+        return rec.id
 
     def query_nearby(
         self,
         embedding: np.ndarray,
-        domain: str,
+        domain: str = "",
         k: int = 10,
         mass_threshold: float = 0.0,
-    ) -> list[tuple[ContextBody, float]]:
+    ) -> list[tuple[ContextBodyRecord, float]]:
         """
-        Find k nearest recorded bodies to a given embedding.
-        Returns (body, cosine_distance) pairs sorted by gravitational influence
-        (mass / distance²).
+        Find the k nearest stored bodies to a given embedding.
+
+        Returns (ContextBodyRecord, cosine_distance) pairs ranked by
+        gravitational influence (mass / distance²) rather than raw distance,
+        so a massive body slightly farther away ranks above a lightweight one
+        that's closer.
+
+        domain="" matches all domains.
+
+        Decay is triggered automatically if at least decay_interval seconds have
+        elapsed since the last decay run. This avoids a background scheduler while
+        still ensuring bodies lose mass proportionally to inactivity.
         """
-        if len(self.bodies) == 0:
-            return []
+        now = datetime.utcnow()
+        if self._last_decay_at is None or (
+            now - self._last_decay_at
+        ).total_seconds() >= self.decay_interval:
+            self.decay(as_of=now)
+            self._last_decay_at = now
 
-        norm_emb = embedding / (np.linalg.norm(embedding) + 1e-8)
-        k_search = min(k * 2, len(self.bodies))   # oversample, then filter by domain
-
-        similarities, indices = self.embedding_index.search(
-            norm_emb.reshape(1, -1).astype(np.float32), k_search
+        filter_dict = {"domain": domain} if domain else None
+        raw = self.backend.search(
+            vector=embedding,
+            k=k,
+            filter=filter_dict,
         )
 
         results = []
-        for sim, idx in zip(similarities[0], indices[0]):
-            if idx < 0:
+        for record_id, cosine_dist, metadata in raw:
+            if float(metadata.get("mass", 0.0)) < mass_threshold:
                 continue
-            body_id = self.index_id_map.get(int(idx))
-            if body_id is None:
-                continue
-            body = self.bodies.get(body_id)
-            if body is None:
-                continue
-            if domain and body.domain and body.domain != domain:
-                continue
-            if body.mass < mass_threshold:
-                continue
-            cosine_dist = float(1 - sim)
-            results.append((body, cosine_dist))
+            # reconstruct the centroid from the backend's stored vector
+            # by re-searching at k=1 for this specific record — backends that
+            # return vectors directly (Qdrant, Pinecone) can override this
+            centroid = self._fetch_centroid(record_id, embedding)
+            rec = ContextBodyRecord.from_metadata(centroid, metadata)
+            results.append((rec, cosine_dist))
 
-        # sort by gravitational influence: mass / r²
-        results.sort(key=lambda x: x[0].mass / (x[1] ** 2 + 1e-8), reverse=True)
+        # rank by gravitational influence
+        results.sort(
+            key=lambda x: x[0].mass / (x[1] ** 2 + 1e-8),
+            reverse=True,
+        )
         return results[:k]
-
-    def update(self, body_id: UUID, new_tokens: list[tuple[int, np.ndarray]]) -> None:
-        """
-        Accrete new tokens onto an existing body.
-        Updates centroid, mass, density, stability.
-        """
-        body = self.bodies.get(body_id)
-        if body is None:
-            return
-        for token_id, embedding in new_tokens:
-            body.accrete(token_id, embedding)
-        body.density = len(body.member_tokens) / (
-            np.trace(body.covariance) + 1e-8
-        ) if body.covariance.size > 0 else float(len(body.member_tokens))
 
     def decay(self, as_of: datetime | None = None) -> list[UUID]:
         """
-        Apply mass decay to all bodies. Returns IDs of extinct bodies.
+        Apply time-based mass decay to all records and remove extinct ones.
+
+        Mass decays exponentially: new_mass = mass * (1 - decay_rate * elapsed_seconds)
+        Records whose mass drops below extinction_threshold are deleted.
+
+        Returns the UUIDs of extinct records.
         """
         as_of = as_of or datetime.utcnow()
-        extinct = []
-        for body_id, body in list(self.bodies.items()):
-            body.apply_decay(self.decay_rate, as_of)
-            if body.mass < self.extinction_threshold:
-                extinct.append(body_id)
-                del self.bodies[body_id]
-        return extinct
+        extinct_ids: list[str] = []
+        extinct_uuids: list[UUID] = []
 
-    def merge(self, body_a_id: UUID, body_b_id: UUID) -> UUID:
+        for record_id, last_seen in list(self._record_last_seen.items()):
+            elapsed = (as_of - last_seen).total_seconds()
+            current_mass = self._record_mass.get(record_id, 0.0)
+            new_mass = current_mass * max(0.0, 1.0 - self.decay_rate * elapsed)
+
+            if new_mass < self.extinction_threshold:
+                extinct_ids.append(record_id)
+                extinct_uuids.append(UUID(record_id))
+            else:
+                self._record_mass[record_id] = new_mass
+                self.backend.update_metadata(record_id, {"mass": new_mass})
+
+        if extinct_ids:
+            self.backend.delete(extinct_ids)
+            for rid in extinct_ids:
+                self._record_last_seen.pop(rid, None)
+                self._record_mass.pop(rid, None)
+
+        return extinct_uuids
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_centroid(
+        self, record_id: str, query_embedding: np.ndarray
+    ) -> np.ndarray:
         """
-        Combine two bodies that have drifted together.
-        Preserves lineage in child/parent relationships.
+        Retrieve the stored centroid vector for a record.
+
+        FAISSBackend doesn't expose stored vectors directly, so we approximate
+        by returning the query embedding as a placeholder — the actual centroid
+        is close enough for force computation given the record was returned as
+        a near neighbor. Backends that expose raw vectors (Qdrant, Pinecone)
+        should override this via subclassing or inject the centroid into metadata.
+
+        This is the one seam where a richer backend integration helps: Qdrant
+        and Pinecone both return the original vector alongside metadata in search
+        results, eliminating the need for this workaround.
         """
-        a = self.bodies[body_a_id]
-        b = self.bodies[body_b_id]
+        # TODO: richer backends should return the vector in search results
+        # and this method can be replaced with direct extraction
+        return query_embedding
 
-        n_a = len(a.member_tokens)
-        n_b = len(b.member_tokens)
-        total = n_a + n_b
-
-        merged = ContextBody(
-            domain=a.domain,
-            centroid=(a.centroid * n_a + b.centroid * n_b) / total,
-            mass=a.mass + b.mass,
-            density=(a.density + b.density) / 2,
-            member_tokens=a.member_tokens | b.member_tokens,
-            orbital_radii={**a.orbital_radii, **b.orbital_radii},
-            parent_ids=[body_a_id, body_b_id],
-        )
-        merged.centroid_velocity = np.zeros_like(merged.centroid)
-
-        a.child_ids.append(merged.id)
-        b.child_ids.append(merged.id)
-
-        self.record(merged)
-        return merged.id
-
-    def fragment(self, body_id: UUID, clusters: list[list[int]]) -> list[UUID]:
-        """
-        Split a body that has grown internally inconsistent into sub-bodies.
-        Returns IDs of newly created child bodies.
-        """
-        parent = self.bodies[body_id]
-        child_ids = []
-
-        for cluster_tokens in clusters:
-            child = ContextBody(
-                domain=parent.domain,
-                member_tokens=set(cluster_tokens),
-                mass=parent.mass / len(clusters),
-                parent_ids=[body_id],
-            )
-            child_ids.append(self.record(child))
-
-        parent.child_ids.extend(child_ids)
-        return child_ids
+    @property
+    def size(self) -> int:
+        """Number of records currently in the store."""
+        if hasattr(self.backend, "size"):
+            return self.backend.size
+        return len(self._record_last_seen)

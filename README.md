@@ -157,8 +157,11 @@ pytest tests/ -v -s
 Early research implementation. Open issues are grouped below by area.
 
 ### Storage & Persistence
-- Cold storage backend — `ContextBodyStore` has a hot FAISS layer but no cold persistence. Needs integration with a vector database (Pinecone, Weaviate, or pgvector) for cross-session body reuse
-- Decay scheduler — `ContextBodyStore.decay()` exists but nothing calls it automatically; needs a background process or per-query trigger
+- ✅ Vector-native architecture — `ContextBodyStore` refactored to a thin wrapper around a `VectorBackend` protocol. `FAISSBackend` is the default in-memory implementation. Swap to Qdrant, Pinecone, or pgvector by passing a different backend at construction.
+- ✅ `ContextBodyRecord` — lightweight persistent record (centroid + scalar metadata only). No relational fields. Serializes to/from flat vector DB payloads via `to_metadata()` / `from_metadata()`.
+- ✅ Decay scheduler — per-query trigger in `query_nearby()`. Decay runs automatically when `decay_interval` seconds have elapsed since the last run (default 60s). No background process required.
+- Production backend implementations — `QdrantBackend`, `PineconeBackend`, `PgvectorBackend` conforming to the `VectorBackend` protocol
+- `_fetch_centroid` workaround — `FAISSBackend` does not expose stored vectors in search results; production backends (Qdrant, Pinecone) return vectors directly and should eliminate this approximation
 
 ### Physics Model
 - Body mass refinement — mass currently equals cluster density only; model weight norms are not yet factored in despite being defined in the formula (`m = W / G`)
@@ -166,7 +169,6 @@ Early research implementation. Open issues are grouped below by area.
 - Domain classifier — domain is passed manually at construction time; no mechanism exists to infer it from the token stream
 
 ### Clustering
-- Merge sync fragility — `GravitationalSampler._update_clustering` removes absorbed bodies using a heuristic; should use the clean label-based approach consistently
 - Border-point bridge case — connectivity fragmentation BFS only walks core points; a cluster bridged solely through border points will not fragment via the structural check (bimodality may still catch it)
 
 ### Evaluation
@@ -174,7 +176,8 @@ Early research implementation. Open issues are grouped below by area.
 
 ### Testing
 - `GravitationalSampler` has no tests — force computation, escape threshold, orbital state updates, and active body sync all need coverage
-- `ContextBodyStore` has no tests — query, record, merge, fragment, and decay operations are untested
+- `ContextBodyStore` has no tests — `record()` deduplication, `query_nearby()` ranking, and `decay()` extinction logic are untested
+- `VectorBackend` / `FAISSBackend` have no tests — upsert, search, delete, and update_metadata need coverage
 - `OrbitalState` has no tests — position, velocity, and acceleration update logic is untested
 
 ### Documentation
