@@ -52,6 +52,7 @@ class GravitationalSampler:
         stability_threshold: float = 0.8,
         resonance_threshold: float = 0.3,
         amplification_threshold: float = 0.2,
+        collision_distance: float = 0.1,
         domain: str = "",
         domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -62,6 +63,7 @@ class GravitationalSampler:
         self.stability_threshold = stability_threshold
         self.resonance_threshold = resonance_threshold
         self.amplification_threshold = amplification_threshold
+        self.collision_distance = collision_distance
         self.domain = domain
         self.domain_classifier = domain_classifier
         self.device = device
@@ -349,6 +351,113 @@ class GravitationalSampler:
         return next_token
 
     # ------------------------------------------------------------------
+    # Collision detection
+    # ------------------------------------------------------------------
+
+    def _check_collisions(self) -> None:
+        """
+        Detect and resolve inelastic collisions between active in-session bodies.
+
+        Scans all pairs of ephemeral ContextBody objects in active_bodies. When
+        two bodies are within collision_distance (cosine), the lighter is absorbed
+        by the heavier using conservation of momentum:
+
+            centroid_merged  = (m_A * c_A + m_B * c_B) / (m_A + m_B)
+            velocity_merged  = (m_A * v_A + m_B * v_B) / (m_A + m_B)
+            mass_merged      = m_A + m_B
+
+        This handles the case where two cluster centroids converge semantically
+        without a bridging token — a gap DBSCAN merge cannot close on its own.
+        The merged body replaces both originals in active_bodies with label=-1
+        (treated as a non-DBSCAN body for label-tracking purposes).
+
+        If the merged body is stable enough, it is persisted to the store.
+        DBSCAN's internal cluster state is left intact — the original clusters
+        continue to receive new tokens, but force computation uses the merged body.
+        """
+        # collect only in-session ContextBody entries (label >= 0)
+        body_entries: list[tuple[int, int, ContextBody]] = [
+            (active_idx, label, body)
+            for active_idx, (label, body, _) in enumerate(self.active_bodies)
+            if isinstance(body, ContextBody) and label >= 0
+        ]
+
+        absorbed: set[int] = set()   # active_bodies indices to remove
+        merged_bodies: list[tuple[int, ContextBody, float]] = []
+
+        for i in range(len(body_entries)):
+            for j in range(i + 1, len(body_entries)):
+                active_idx_a, _, body_a = body_entries[i]
+                active_idx_b, _, body_b = body_entries[j]
+
+                if active_idx_a in absorbed or active_idx_b in absorbed:
+                    continue
+
+                r = float(1.0 - np.dot(body_a.centroid, body_b.centroid) / (
+                    np.linalg.norm(body_a.centroid) * np.linalg.norm(body_b.centroid) + 1e-8
+                ))
+
+                if r >= self.collision_distance:
+                    continue
+
+                # inelastic collision — lighter absorbed by heavier
+                heavy, light = (
+                    (body_a, body_b) if body_a.mass >= body_b.mass
+                    else (body_b, body_a)
+                )
+                heavy_active_idx = (
+                    active_idx_a if body_a.mass >= body_b.mass else active_idx_b
+                )
+                light_active_idx = (
+                    active_idx_b if body_a.mass >= body_b.mass else active_idx_a
+                )
+
+                total_mass = heavy.mass + light.mass
+
+                merged = ContextBody(
+                    domain=heavy.domain,
+                    centroid=(
+                        heavy.centroid * heavy.mass + light.centroid * light.mass
+                    ) / total_mass,
+                    centroid_velocity=(
+                        heavy.centroid_velocity * heavy.mass
+                        + light.centroid_velocity * light.mass
+                    ) / total_mass,
+                    mass=total_mass,
+                    density=heavy.density + light.density,
+                    # stability is the minimum of the two — a fresh collision
+                    # is less stable than either parent alone
+                    stability=min(heavy.stability, light.stability),
+                    member_tokens=heavy.member_tokens | light.member_tokens,
+                    parent_ids=[heavy.id, light.id],
+                )
+
+                if merged.stability >= self.stability_threshold:
+                    merged_id = self.body_store.record(
+                        centroid=merged.centroid,
+                        mass=merged.mass,
+                        stability=merged.stability,
+                        domain=merged.domain,
+                    )
+                    for _, other_body, _ in self.active_bodies:
+                        if isinstance(other_body, ContextBodyRecord):
+                            self.body_store.record_resonance(
+                                str(merged_id), str(other_body.id)
+                            )
+
+                absorbed.add(heavy_active_idx)
+                absorbed.add(light_active_idx)
+                # label=-1: merged body is not tracked by DBSCAN label logic
+                merged_bodies.append((-1, merged, 0.0))
+
+        if absorbed:
+            self.active_bodies = [
+                entry for active_idx, entry in enumerate(self.active_bodies)
+                if active_idx not in absorbed
+            ]
+            self.active_bodies.extend(merged_bodies)
+
+    # ------------------------------------------------------------------
     # Clustering maintenance
     # ------------------------------------------------------------------
 
@@ -430,3 +539,7 @@ class GravitationalSampler:
                                 str(frag_id), str(other_body.id)
                             )
                 self.active_bodies.append((frag_label, frag_body, 0.0))
+
+        # check for inelastic collisions among in-session bodies after all
+        # DBSCAN events have been applied this step
+        self._check_collisions()

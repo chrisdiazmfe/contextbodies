@@ -134,6 +134,7 @@ clf = DomainClassifier(
 | `stability_threshold` | Minimum stability score for an emergent body to be persisted | `0.8` |
 | `resonance_threshold` | Minimum resonance score for a body pair to produce a Lagrange midpoint force | `0.3` |
 | `amplification_threshold` | Cosine distance below which nearby bodies are merged into a virtual body for force computation, preventing gravity well amplification | `0.2` |
+| `collision_distance` | Cosine distance below which two in-session bodies undergo an inelastic collision — lighter absorbed by heavier with momentum conservation | `0.1` |
 | `domain` | Static domain label. Ignored when `domain_classifier` is provided | `""` |
 | `domain_classifier` | Optional `DomainClassifier` — infers domain from the token stream automatically | `None` |
 
@@ -274,7 +275,7 @@ Early research implementation. Open issues are grouped below by area.
 
 ### Collision Mechanics
 - ✅ Gravitational amplification — `GravitationalSampler._group_active_bodies()` merges bodies within `amplification_threshold` (default 0.2 cosine distance) into virtual bodies with mass-weighted centroids and summed masses before force computation. Three bodies near "machine learning" produce the same force as one body of their combined mass, not 3×. Tunable via `amplification_threshold`.
-- Inelastic collision rule — when two active bodies converge within a session, the lighter should be absorbed by the heavier with momentum exchange (centroid velocity weighted by mass ratio), rather than the current mass-average dedup which ignores velocity entirely
+- ✅ Inelastic collision rule — `GravitationalSampler._check_collisions()` scans active `ContextBody` pairs after each DBSCAN update. When two bodies are within `collision_distance` (default 0.1 cosine), the lighter is absorbed by the heavier with momentum conservation: merged centroid and velocity are mass-weighted averages, merged mass is the sum. The merged body replaces both originals in `active_bodies` and is persisted if stable. Tunable via `collision_distance`.
 - Cross-session collision — a decayed body and a new emergent body representing the same concept can coexist as separate records if their distance exceeds `dedup_distance`, doubling the gravitational influence of that concept; needs a broader re-emergence detection pass
 - Recency weighting — `last_seen` currently only drives extinction; gravitational force should be scaled by `exp(-λ * time_since_last_seen)` so temporally distant bodies exert proportionally less pull regardless of stored mass
 - Collision events — `IncrementalDBSCAN.update()` returns `new_bodies`, `merged_events`, and `fragmented_events` but no `collision_events`; converging bodies that don't fully merge are a distinct physical event worth surfacing to `GravitationalSampler`
