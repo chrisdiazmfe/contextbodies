@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -37,6 +39,12 @@ class GravitationalSampler:
                              (they have "escape velocity" from all bodies).
         stability_threshold — minimum stability score for a body to be persisted.
         resonance_threshold — minimum resonance score for a Lagrange midpoint force.
+        recency_decay_lambda — time-decay rate λ for persisted bodies. Force from
+                             a ContextBodyRecord is scaled by exp(-λ * elapsed_seconds)
+                             where elapsed = now - last_seen. λ=0.0 (default) disables
+                             recency weighting entirely. λ=1e-4 gives a half-life of
+                             ~2 hours; λ=1e-5 gives ~19 hours. In-session ContextBody
+                             objects are always treated as fully fresh (factor=1.0).
         domain             — static domain label used when no domain_classifier
                              is provided. Ignored if domain_classifier is set.
         domain_classifier  — optional DomainClassifier that infers the domain
@@ -53,6 +61,7 @@ class GravitationalSampler:
         resonance_threshold: float = 0.3,
         amplification_threshold: float = 0.2,
         collision_distance: float = 0.1,
+        recency_decay_lambda: float = 0.0,
         domain: str = "",
         domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -64,6 +73,7 @@ class GravitationalSampler:
         self.resonance_threshold = resonance_threshold
         self.amplification_threshold = amplification_threshold
         self.collision_distance = collision_distance
+        self.recency_decay_lambda = recency_decay_lambda
         self.domain = domain
         self.domain_classifier = domain_classifier
         self.device = device
@@ -171,6 +181,26 @@ class GravitationalSampler:
 
         return f_magnitude * r_hat
 
+    def _recency_factor(self, body: _GravitySource) -> float:
+        """
+        Time-decay weight for a body: exp(-λ * elapsed_seconds).
+
+        Returns 1.0 for:
+            - in-session ContextBody objects (always fresh, no last_seen)
+            - any body when recency_decay_lambda == 0.0 (feature disabled)
+
+        For ContextBodyRecord, elapsed is seconds since last_seen. This scales
+        gravitational force continuously — a body seen 2 hours ago with λ=1e-4
+        retains ~70% force; one unseen for a week retains less than 2%.
+
+        The product of two records' factors is used for resonance pairs so that
+        a resonance force requires *both* bodies to have been recently active.
+        """
+        if self.recency_decay_lambda <= 0.0 or not isinstance(body, ContextBodyRecord):
+            return 1.0
+        elapsed = (datetime.utcnow() - body.last_seen).total_seconds()
+        return float(np.exp(-self.recency_decay_lambda * elapsed))
+
     def _group_active_bodies(self) -> list[tuple[np.ndarray, float]]:
         """
         Group active bodies within amplification_threshold of each other into
@@ -192,7 +222,9 @@ class GravitationalSampler:
 
         for _, body, _ in self.active_bodies:
             centroid = body.centroid
-            mass = body.mass
+            mass = body.mass * self._recency_factor(body)
+            if mass <= 0.0:
+                continue  # fully decayed — skip without contributing to any group
             placed = False
 
             for group in groups:
@@ -278,7 +310,11 @@ class GravitationalSampler:
                 # joint mass = geometric mean; preserves units and scales naturally
                 joint_mass = float(np.sqrt(body_a.mass * body_b.mass))
 
-                f_magnitude = self.G * token_mass * joint_mass * score / (r ** 2)
+                # resonance force requires both bodies to be temporally fresh;
+                # use the product of factors so either body going cold kills the term
+                recency = self._recency_factor(body_a) * self._recency_factor(body_b)
+
+                f_magnitude = self.G * token_mass * joint_mass * score * recency / (r ** 2)
 
                 direction = midpoint - token_embedding
                 d_norm = np.linalg.norm(direction)

@@ -135,6 +135,7 @@ clf = DomainClassifier(
 | `resonance_threshold` | Minimum resonance score for a body pair to produce a Lagrange midpoint force | `0.3` |
 | `amplification_threshold` | Cosine distance below which nearby bodies are merged into a virtual body for force computation, preventing gravity well amplification | `0.2` |
 | `collision_distance` | Cosine distance below which two in-session bodies undergo an inelastic collision — lighter absorbed by heavier with momentum conservation | `0.1` |
+| `recency_decay_lambda` | Time-decay rate λ for persisted body force: `exp(-λ * elapsed_seconds)`. `0.0` disables recency weighting. `1e-4` ≈ 2-hour half-life; `1e-5` ≈ 19-hour half-life. In-session bodies always get factor 1.0 | `0.0` |
 | `domain` | Static domain label. Ignored when `domain_classifier` is provided | `""` |
 | `domain_classifier` | Optional `DomainClassifier` — infers domain from the token stream automatically | `None` |
 
@@ -277,7 +278,7 @@ Early research implementation. Open issues are grouped below by area.
 - ✅ Gravitational amplification — `GravitationalSampler._group_active_bodies()` merges bodies within `amplification_threshold` (default 0.2 cosine distance) into virtual bodies with mass-weighted centroids and summed masses before force computation. Three bodies near "machine learning" produce the same force as one body of their combined mass, not 3×. Tunable via `amplification_threshold`.
 - ✅ Inelastic collision rule — `GravitationalSampler._check_collisions()` scans active `ContextBody` pairs after each DBSCAN update. When two bodies are within `collision_distance` (default 0.1 cosine), the lighter is absorbed by the heavier with momentum conservation: merged centroid and velocity are mass-weighted averages, merged mass is the sum. The merged body replaces both originals in `active_bodies` and is persisted if stable. Tunable via `collision_distance`.
 - ✅ Cross-session collision — `ContextBodyStore.record()` now runs a three-stage check before inserting: exact dedup (< `dedup_distance`), re-emergence (< `reemergence_distance` and `mass < reemergence_mass_threshold`), then new record. A dormant body that a new emergent body converges on is re-energized with a mass-weighted boost rather than duplicated. This prevents the same concept from accumulating multiple low-mass ghosts that together double the gravitational influence of a theme.
-- Recency weighting — `last_seen` currently only drives extinction; gravitational force should be scaled by `exp(-λ * time_since_last_seen)` so temporally distant bodies exert proportionally less pull regardless of stored mass
+- ✅ Recency weighting — `GravitationalSampler._recency_factor()` scales force from `ContextBodyRecord` bodies by `exp(-λ * elapsed_seconds)` where elapsed = now − `last_seen`. Applied to effective mass in `_group_active_bodies()` and as a joint factor on resonance forces in `_compute_resonance_forces()`. In-session `ContextBody` objects always return factor 1.0. Disabled by default (`recency_decay_lambda=0.0`); set to `1e-4` for a ~2-hour half-life or `1e-5` for ~19 hours.
 - Collision events — `IncrementalDBSCAN.update()` returns `new_bodies`, `merged_events`, and `fragmented_events` but no `collision_events`; converging bodies that don't fully merge are a distinct physical event worth surfacing to `GravitationalSampler`
 
 ### Clustering
