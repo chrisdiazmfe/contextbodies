@@ -79,6 +79,52 @@ text = generate(
 print(text)
 ```
 
+### With automatic domain inference
+
+When bodies have already accumulated in the store across sessions, use `DomainClassifier.from_body_centroids()` to build anchors from them. The sampler then infers and tracks domain automatically from the token stream — no hard-coded domain string needed.
+
+```python
+from contextbodies import DomainClassifier, GravitationalSampler, ContextBodyStore
+
+store = ContextBodyStore(embedding_dim=768, backend=QdrantBackend(
+    QdrantClient(host="localhost", port=6333)
+))
+
+# build domain anchors from bodies already in the store
+bodies_by_domain = {
+    "code":    [b.centroid for b in store.query_nearby(code_anchor, domain="code", k=50)],
+    "medical": [b.centroid for b in store.query_nearby(medical_anchor, domain="medical", k=50)],
+}
+clf = DomainClassifier.from_body_centroids(
+    {d: [r.centroid for r, _ in pairs] for d, pairs in bodies_by_domain.items()},
+    match_threshold=0.3,   # max cosine distance to accept a domain match
+    ema_alpha=0.1,         # how quickly domain shifts mid-conversation
+)
+
+sampler = GravitationalSampler(
+    body_store=store,
+    G=1.0,
+    domain_classifier=clf,  # domain inferred from token stream; "domain" param ignored
+)
+
+text = generate(model=model, tokenizer=tokenizer,
+                prompt="Write a Python function to parse JSON",
+                sampler=sampler, max_tokens=200)
+```
+
+You can also register anchors manually if you have representative embeddings for each domain:
+
+```python
+clf = DomainClassifier(
+    domain_anchors={
+        "code":    embed("python function class method variable"),
+        "medical": embed("diagnosis treatment patient clinical"),
+        "legal":   embed("contract statute liability jurisdiction"),
+    },
+    fallback_domain="general",
+)
+```
+
 ## Key Parameters
 
 | Parameter | Description | Default |
@@ -87,7 +133,8 @@ print(text)
 | `escape_threshold` | Minimum force magnitude to bias sampling. Tokens below this are unaffected | `0.01` |
 | `stability_threshold` | Minimum stability score for an emergent body to be persisted | `0.8` |
 | `resonance_threshold` | Minimum resonance score for a body pair to produce a Lagrange midpoint force | `0.3` |
-| `domain` | Domain label for body storage and retrieval | `""` |
+| `domain` | Static domain label. Ignored when `domain_classifier` is provided | `""` |
+| `domain_classifier` | Optional `DomainClassifier` — infers domain from the token stream automatically | `None` |
 
 ## Body Persistence
 
@@ -103,7 +150,10 @@ Stable emergent bodies are recorded to the `ContextBodyStore` and reused across 
 ```
 contextbodies/
 ├── context_body.py          # ContextBody dataclass — mass, centroid, orbital membership
-├── context_body_store.py    # Persistent store — FAISS hot layer + cold vector DB
+├── context_body_record.py   # ContextBodyRecord — persistent form stored in vector DB
+├── context_body_store.py    # Persistent store — thin wrapper around VectorBackend
+├── vector_backend.py        # VectorBackend protocol + FAISSBackend + QdrantBackend
+├── domain_classifier.py     # DomainClassifier — infers domain from token stream
 ├── orbital_state.py         # Position/velocity/acceleration of the context vector
 ├── incremental_dbscan.py    # Online clustering — discovers emergent bodies token by token
 ├── gravitational_sampler.py # Core sampler — replaces temperature at inference time
@@ -219,7 +269,7 @@ Early research implementation. Open issues are grouped below by area.
 ### Physics Model
 - ✅ Body mass refinement — body mass is now the sum of constituent token masses (`Σ ||W[token_id]|| / G`). `IncrementalDBSCAN.update()` accepts `token_mass`, stores it per point, and `_build_body()` sums them. `GravitationalSampler.sample()` computes mass from weight norms and passes it through. Prompt tokens default to `token_mass=1.0` as an approximation.
 - ✅ Orbital resonance detection — `ContextBodyRecord.resonance_partners` accumulates co-occurrence scores across sessions via `ContextBodyStore.record_resonance()`. When two resonant bodies are co-active, `GravitationalSampler._compute_resonance_forces()` adds a Lagrange midpoint force toward the semantic region between them, scaled by `sqrt(m_A * m_B) * score`. Resonance is recorded automatically when a new body is persisted alongside existing store-loaded bodies. Tunable via `resonance_threshold` (default 0.3).
-- Domain classifier — domain is passed manually at construction time; no mechanism exists to infer it from the token stream
+- ✅ Domain classifier — `DomainClassifier` infers the active domain from the token embedding stream via an EMA context direction compared against known domain anchors by cosine distance. Seeded from the full prompt in `initialize()`, updated on every generated token in `sample()`. Anchors can be pre-defined embeddings, derived from body centroids via `from_body_centroids()`, or added at runtime via `add_anchor()`. Pass as `domain_classifier=` to `GravitationalSampler`; `domain` is then updated automatically each step.
 
 ### Collision Mechanics
 - Gravitational amplification — multiple bodies near the same region in embedding space sum their forces with no awareness of each other, creating unintended gravity wells that over-pull sampling; force computation should account for body-to-body proximity

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from context_body import ContextBody
 from context_body_record import ContextBodyRecord
 from context_body_store import ContextBodyStore
+from domain_classifier import DomainClassifier
 from incremental_dbscan import IncrementalDBSCAN
 from orbital_state import OrbitalState
 
@@ -35,6 +36,12 @@ class GravitationalSampler:
                              Tokens below this threshold are unaffected
                              (they have "escape velocity" from all bodies).
         stability_threshold — minimum stability score for a body to be persisted.
+        resonance_threshold — minimum resonance score for a Lagrange midpoint force.
+        domain             — static domain label used when no domain_classifier
+                             is provided. Ignored if domain_classifier is set.
+        domain_classifier  — optional DomainClassifier that infers the domain
+                             from the token stream. When provided, self.domain
+                             is updated automatically on every generated token.
     """
 
     def __init__(
@@ -45,6 +52,7 @@ class GravitationalSampler:
         stability_threshold: float = 0.8,
         resonance_threshold: float = 0.3,
         domain: str = "",
+        domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.body_store = body_store
@@ -53,6 +61,7 @@ class GravitationalSampler:
         self.stability_threshold = stability_threshold
         self.resonance_threshold = resonance_threshold
         self.domain = domain
+        self.domain_classifier = domain_classifier
         self.device = device
 
         self.orbital_state: OrbitalState | None = None
@@ -74,8 +83,16 @@ class GravitationalSampler:
         """
         Seed the sampler from the prompt context.
         Loads relevant recorded bodies and initializes orbital state + clustering.
+
+        If a domain_classifier was provided, seeds it from the prompt embeddings
+        so the initial domain is inferred rather than hard-coded.
         """
-        initial_pos = context_embeddings[0].cpu().numpy()
+        embs_np = context_embeddings.cpu().numpy()   # [context_len, D]
+        initial_pos = embs_np[0]
+
+        # infer domain from the full prompt if a classifier is available
+        if self.domain_classifier is not None:
+            self.domain = self.domain_classifier.seed(embs_np)
 
         self.orbital_state = OrbitalState.initialize(initial_pos)
 
@@ -87,10 +104,9 @@ class GravitationalSampler:
 
         # seed clustering with all prompt tokens
         for i in range(context_embeddings.shape[0]):
-            emb = context_embeddings[i].cpu().numpy()
-            self.clustering.update(token_id=-i, embedding=emb)
+            self.clustering.update(token_id=-i, embedding=embs_np[i])
 
-        # load relevant recorded bodies from the store
+        # load relevant recorded bodies from the store using the (now inferred) domain
         # query_nearby returns ContextBodyRecord objects — label=-1 marks them
         # as store-sourced so _update_clustering doesn't try to remove them
         self.active_bodies = [
@@ -268,6 +284,10 @@ class GravitationalSampler:
         # update orbital state with sampled token's embedding
         next_emb = token_embeddings[next_token].cpu().numpy()
         self.orbital_state.update(next_emb)
+
+        # update domain inference from the new token embedding
+        if self.domain_classifier is not None:
+            self.domain = self.domain_classifier.update(next_emb)
 
         # compute token mass from weight norms, then update clustering
         next_token_mass = self._compute_token_mass(next_token, weight_matrix)

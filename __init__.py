@@ -20,6 +20,8 @@ Core concepts:
                           bodies as tokens arrive.
     GravitationalSampler — the sampling engine; replaces temperature with
                           gravitational force computed from active bodies.
+    DomainClassifier    — infers the active domain from the token embedding
+                          stream via EMA context direction + nearest anchor.
 
 Quickstart:
     from contextbodies import GravitationalSampler, ContextBodyStore
@@ -42,6 +44,7 @@ Swapping to Qdrant (production):
 from context_body import ContextBody
 from context_body_record import ContextBodyRecord
 from context_body_store import ContextBodyStore
+from domain_classifier import DomainClassifier
 from gravitational_sampler import GravitationalSampler
 from incremental_dbscan import IncrementalDBSCAN
 from orbital_state import OrbitalState
@@ -51,6 +54,7 @@ __all__ = [
     "ContextBody",
     "ContextBodyRecord",
     "ContextBodyStore",
+    "DomainClassifier",
     "FAISSBackend",
     "GravitationalSampler",
     "IncrementalDBSCAN",
