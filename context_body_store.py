@@ -39,8 +39,10 @@ class ContextBodyStore:
         backend: VectorBackend | None = None,
         decay_rate: float = 1e-5,
         extinction_threshold: float = 0.01,
-        dedup_distance: float = 0.05,   # cosine distance below which two bodies are the same
-        decay_interval: float = 60.0,   # seconds between automatic decay runs
+        dedup_distance: float = 0.05,          # cosine distance for exact-same-concept dedup
+        decay_interval: float = 60.0,          # seconds between automatic decay runs
+        reemergence_distance: float = 0.15,    # wider window for dormant re-emergence check
+        reemergence_mass_threshold: float = 0.1,  # mass below which a record is "dormant"
     ):
         self.embedding_dim = embedding_dim
         self.backend = backend or FAISSBackend(embedding_dim)
@@ -48,6 +50,8 @@ class ContextBodyStore:
         self.extinction_threshold = extinction_threshold
         self.dedup_distance = dedup_distance
         self.decay_interval = decay_interval
+        self.reemergence_distance = reemergence_distance
+        self.reemergence_mass_threshold = reemergence_mass_threshold
 
         # local cache of record IDs → last_seen, for decay bookkeeping
         # (avoids a full scan of the backend on every decay call)
@@ -76,17 +80,26 @@ class ContextBodyStore:
         """
         Persist a stabilized context body.
 
-        If a near-duplicate already exists (cosine distance < dedup_distance),
-        updates its mass (weighted average) and last_seen timestamp instead of
-        inserting a new record. This prevents the store from accumulating
-        redundant bodies for the same semantic concept across conversations.
+        Three checks run in order before a new record is created:
+
+        1. Exact dedup (dedup_distance): near-identical concept already exists →
+           update its mass as a weighted average. Prevents redundant records for
+           the same concept seen in multiple sessions.
+
+        2. Re-emergence (reemergence_distance + reemergence_mass_threshold): a
+           dormant (low-mass) record exists within a wider window → this is a
+           cross-session collision. Boost the dormant record's mass rather than
+           creating a parallel record that would double the gravitational influence
+           of the concept. The concept has re-emerged, not split.
+
+        3. New record: no match found → insert a fresh ContextBodyRecord.
 
         Returns the UUID of the inserted or updated record.
         """
-        # near-duplicate check
+        # --- 1. exact dedup -----------------------------------------------
         nearby = self.query_nearby(centroid, domain=domain, k=1)
         if nearby and nearby[0][1] < self.dedup_distance:
-            existing, dist = nearby[0]
+            existing, _ = nearby[0]
             new_mass = (existing.mass + mass) / 2
             now = datetime.utcnow()
             self.backend.update_metadata(str(existing.id), {
@@ -97,7 +110,36 @@ class ContextBodyStore:
             self._record_last_seen[str(existing.id)] = now
             return existing.id
 
-        # new record
+        # --- 2. re-emergence check ----------------------------------------
+        # Search directly via the backend (bypassing gravitational ranking) so
+        # dormant low-mass records — which rank poorly by mass / r² — are visible.
+        filter_dict = {"domain": domain} if domain else None
+        candidates = self.backend.search(
+            vector=centroid,
+            k=5,
+            filter=filter_dict,
+        )
+        for record_id, dist, metadata, _ in candidates:
+            if dist >= self.reemergence_distance:
+                break  # sorted nearest-first; no closer candidates remain
+            current_mass = self._record_mass.get(
+                record_id, float(metadata.get("mass", 0.0))
+            )
+            if current_mass < self.reemergence_mass_threshold:
+                # dormant near-match: re-energize rather than duplicate
+                # new mass weighted toward the incoming body (it's the active signal)
+                alpha = mass / (current_mass + mass + 1e-8)
+                new_mass = (1.0 - alpha) * current_mass + alpha * mass
+                now = datetime.utcnow()
+                self.backend.update_metadata(record_id, {
+                    "mass": new_mass,
+                    "last_seen": now.isoformat(),
+                })
+                self._record_mass[record_id] = new_mass
+                self._record_last_seen[record_id] = now
+                return UUID(record_id)
+
+        # --- 3. new record ------------------------------------------------
         rec = ContextBodyRecord(
             centroid=centroid,
             mass=mass,
