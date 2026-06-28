@@ -51,6 +51,7 @@ class GravitationalSampler:
         escape_threshold: float = 0.01,
         stability_threshold: float = 0.8,
         resonance_threshold: float = 0.3,
+        amplification_threshold: float = 0.2,
         domain: str = "",
         domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -60,6 +61,7 @@ class GravitationalSampler:
         self.escape_threshold = escape_threshold
         self.stability_threshold = stability_threshold
         self.resonance_threshold = resonance_threshold
+        self.amplification_threshold = amplification_threshold
         self.domain = domain
         self.domain_classifier = domain_classifier
         self.device = device
@@ -137,32 +139,77 @@ class GravitationalSampler:
         self,
         token_embedding: np.ndarray,
         token_mass: float,
-        body: ContextBody,
+        body_centroid: np.ndarray,
+        body_mass: float,
     ) -> np.ndarray:
         """
-        Compute gravitational force vector on a token from a single context body.
+        Compute gravitational force vector on a token from a body (or virtual body).
 
             F = G * (m_token * m_body) / r²  ·  r̂
+
+        Accepts centroid and mass directly so the same formula works for both
+        individual active bodies and mass-weighted virtual groups produced by
+        _group_active_bodies().
 
         Distance r is cosine distance (angle-based), appropriate for embedding
         spaces where semantics live in direction rather than magnitude.
         Force vector points toward the body centroid.
         """
-        r_vec = token_embedding - body.centroid
+        r_vec = token_embedding - body_centroid
 
-        # cosine distance as scalar r
-        r = float(1 - np.dot(token_embedding, body.centroid) / (
-            np.linalg.norm(token_embedding) * np.linalg.norm(body.centroid) + 1e-8
+        r = float(1.0 - np.dot(token_embedding, body_centroid) / (
+            np.linalg.norm(token_embedding) * np.linalg.norm(body_centroid) + 1e-8
         ))
-        r = max(r, 1e-8)  # avoid singularity at r = 0
+        r = max(r, 1e-8)
 
-        f_magnitude = self.G * (token_mass * body.mass) / (r ** 2)
+        f_magnitude = self.G * (token_mass * body_mass) / (r ** 2)
 
-        # unit vector pointing toward body centroid
         r_norm = np.linalg.norm(r_vec)
         r_hat = -r_vec / (r_norm + 1e-8)
 
         return f_magnitude * r_hat
+
+    def _group_active_bodies(self) -> list[tuple[np.ndarray, float]]:
+        """
+        Group active bodies within amplification_threshold of each other into
+        virtual bodies, each with a mass-weighted centroid and summed mass.
+
+        This prevents gravitational amplification — the unintended gravity well
+        that forms when multiple bodies cluster near the same concept and their
+        forces sum independently. A single body of mass Σmᵢ at the mass-weighted
+        centroid is the physically correct representation.
+
+        Uses greedy single-pass grouping: each body joins the first existing group
+        whose centroid is within amplification_threshold (cosine distance), or
+        starts a new group if none qualifies. O(n²) in active body count, which
+        is typically small (<50).
+
+        Returns (virtual_centroid, total_mass) pairs — one per group.
+        """
+        groups: list[list] = []  # [[centroid, mass], ...]
+
+        for _, body, _ in self.active_bodies:
+            centroid = body.centroid
+            mass = body.mass
+            placed = False
+
+            for group in groups:
+                g_centroid, g_mass = group
+                r = float(1.0 - np.dot(centroid, g_centroid) / (
+                    np.linalg.norm(centroid) * np.linalg.norm(g_centroid) + 1e-8
+                ))
+                if r < self.amplification_threshold:
+                    # mass-weighted centroid update
+                    total = g_mass + mass
+                    group[0] = (g_centroid * g_mass + centroid * mass) / total
+                    group[1] = total
+                    placed = True
+                    break
+
+            if not placed:
+                groups.append([centroid.copy(), mass])
+
+        return [(np.array(g[0]), g[1]) for g in groups]
 
     def _compute_resonance_forces(
         self,
@@ -260,13 +307,19 @@ class GravitationalSampler:
         vocab_size = logits.shape[0]
         gravity_bias = np.zeros(vocab_size, dtype=np.float32)
 
+        # group nearby bodies into virtual bodies once per step — O(n²) in
+        # active body count but n is small; avoids recomputing for every token
+        virtual_bodies = self._group_active_bodies()
+
         for token_id in range(vocab_size):
             token_emb = token_embeddings[token_id].cpu().numpy()
             token_mass = self._compute_token_mass(token_id, weight_matrix)
 
             total_force = np.zeros_like(token_emb)
-            for _, body, _ in self.active_bodies:
-                total_force += self._gravitational_force(token_emb, token_mass, body)
+            for v_centroid, v_mass in virtual_bodies:
+                total_force += self._gravitational_force(
+                    token_emb, token_mass, v_centroid, v_mass
+                )
             total_force += self._compute_resonance_forces(token_emb, token_mass)
 
             force_magnitude = float(np.linalg.norm(total_force))

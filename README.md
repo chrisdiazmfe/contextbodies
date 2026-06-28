@@ -133,6 +133,7 @@ clf = DomainClassifier(
 | `escape_threshold` | Minimum force magnitude to bias sampling. Tokens below this are unaffected | `0.01` |
 | `stability_threshold` | Minimum stability score for an emergent body to be persisted | `0.8` |
 | `resonance_threshold` | Minimum resonance score for a body pair to produce a Lagrange midpoint force | `0.3` |
+| `amplification_threshold` | Cosine distance below which nearby bodies are merged into a virtual body for force computation, preventing gravity well amplification | `0.2` |
 | `domain` | Static domain label. Ignored when `domain_classifier` is provided | `""` |
 | `domain_classifier` | Optional `DomainClassifier` — infers domain from the token stream automatically | `None` |
 
@@ -272,7 +273,7 @@ Early research implementation. Open issues are grouped below by area.
 - ✅ Domain classifier — `DomainClassifier` infers the active domain from the token embedding stream via an EMA context direction compared against known domain anchors by cosine distance. Seeded from the full prompt in `initialize()`, updated on every generated token in `sample()`. Anchors can be pre-defined embeddings, derived from body centroids via `from_body_centroids()`, or added at runtime via `add_anchor()`. Pass as `domain_classifier=` to `GravitationalSampler`; `domain` is then updated automatically each step.
 
 ### Collision Mechanics
-- Gravitational amplification — multiple bodies near the same region in embedding space sum their forces with no awareness of each other, creating unintended gravity wells that over-pull sampling; force computation should account for body-to-body proximity
+- ✅ Gravitational amplification — `GravitationalSampler._group_active_bodies()` merges bodies within `amplification_threshold` (default 0.2 cosine distance) into virtual bodies with mass-weighted centroids and summed masses before force computation. Three bodies near "machine learning" produce the same force as one body of their combined mass, not 3×. Tunable via `amplification_threshold`.
 - Inelastic collision rule — when two active bodies converge within a session, the lighter should be absorbed by the heavier with momentum exchange (centroid velocity weighted by mass ratio), rather than the current mass-average dedup which ignores velocity entirely
 - Cross-session collision — a decayed body and a new emergent body representing the same concept can coexist as separate records if their distance exceeds `dedup_distance`, doubling the gravitational influence of that concept; needs a broader re-emergence detection pass
 - Recency weighting — `last_seen` currently only drives extinction; gravitational force should be scaled by `exp(-λ * time_since_last_seen)` so temporally distant bodies exert proportionally less pull regardless of stored mass
