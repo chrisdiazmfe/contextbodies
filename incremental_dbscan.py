@@ -74,6 +74,11 @@ class IncrementalDBSCAN:
         bimodality_valley_depth           — valley height must be below this fraction of the
                                             smaller peak height. Default: 0.5 (valley < 50% of
                                             smaller peak). Lower = less sensitive.
+        collision_detection_threshold     — centroid-to-centroid cosine distance below which two
+                                            clusters are reported as a collision_event in update().
+                                            Distinct from eps (point-to-point) and from the
+                                            sampler's collision_distance (inelastic merger threshold).
+                                            Set to 0.0 to disable. Default: 0.2.
     """
 
     def __init__(
@@ -87,6 +92,7 @@ class IncrementalDBSCAN:
         bimodality_min_cluster_size: int | None = None,
         bimodality_elongation_threshold: float = 2.0,
         bimodality_valley_depth: float = 0.5,
+        collision_detection_threshold: float = 0.2,
     ):
         self.eps = eps
         self.min_samples = min_samples
@@ -101,6 +107,7 @@ class IncrementalDBSCAN:
         )
         self.bimodality_elongation_threshold = bimodality_elongation_threshold
         self.bimodality_valley_depth = bimodality_valley_depth
+        self.collision_detection_threshold = collision_detection_threshold
 
         # per-point state
         self.embeddings: list[np.ndarray] = []
@@ -536,7 +543,12 @@ class IncrementalDBSCAN:
         token_id: int,
         embedding: np.ndarray,
         token_mass: float = 1.0,
-    ) -> tuple[list[ContextBody], list[tuple[int, int]], list[tuple[int, list[ContextBody]]]]:
+    ) -> tuple[
+        list[ContextBody],
+        list[tuple[int, int]],
+        list[tuple[int, list[ContextBody]]],
+        list[tuple[int, int, float]],
+    ]:
         """
         Add a new token and update cluster state.
 
@@ -551,6 +563,12 @@ class IncrementalDBSCAN:
             merged_events     — [(absorbed_label, surviving_label), ...]
             fragmented_events — [(old_label, [new_body, ...]), ...]
                                 One entry per cluster that split this step.
+            collision_events  — [(label_a, label_b, centroid_distance), ...]
+                                Pairs of clusters whose centroids are within
+                                collision_detection_threshold of each other this step,
+                                but have not been DBSCAN-merged. These are "near-approach"
+                                events — the clusters are converging semantically.
+                                Empty list when collision_detection_threshold == 0.0.
         """
         idx = len(self.embeddings)
         self.embeddings.append(embedding)
@@ -569,6 +587,7 @@ class IncrementalDBSCAN:
         new_bodies: list[ContextBody] = []
         merged_events: list[tuple[int, int]] = []
         fragmented_events: list[tuple[int, list[ContextBody]]] = []
+        collision_events: list[tuple[int, int, float]] = []
 
         # track which cluster labels were touched this step so we can check
         # fragmentation once per affected cluster at the end
@@ -635,7 +654,31 @@ class IncrementalDBSCAN:
             if frag_labels:
                 fragmented_events.append((touched_label, frag_bodies))
 
-        return new_bodies, merged_events, fragmented_events
+        # detect near-approach collisions: cluster centroid pairs within
+        # collision_detection_threshold that have NOT been DBSCAN-merged this step.
+        # These are distinct from eps-merges (point-to-point) and from the sampler's
+        # inelastic collision rule (centroid merger): they are an intermediate signal
+        # — two bodies converging semantically but still structurally separate.
+        if self.collision_detection_threshold > 0.0 and len(self.clusters) >= 2:
+            merged_this_step = {
+                frozenset({absorbed, surviving})
+                for absorbed, surviving in merged_events
+            }
+            cluster_labels = list(self.clusters.keys())
+            for ci in range(len(cluster_labels)):
+                for cj in range(ci + 1, len(cluster_labels)):
+                    la, lb = cluster_labels[ci], cluster_labels[cj]
+                    if frozenset({la, lb}) in merged_this_step:
+                        continue  # already unified — not a near-approach
+                    ca = self.centroids.get(la)
+                    cb = self.centroids.get(lb)
+                    if ca is None or cb is None:
+                        continue
+                    dist = self._cosine_dist(ca, cb)
+                    if dist < self.collision_detection_threshold:
+                        collision_events.append((la, lb, dist))
+
+        return new_bodies, merged_events, fragmented_events, collision_events
 
     def _build_body(self, label: int) -> ContextBody:
         """

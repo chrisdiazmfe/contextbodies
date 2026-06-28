@@ -85,6 +85,11 @@ class GravitationalSampler:
         self.active_bodies: list[tuple[int, _GravitySource, float]] = []
         self.clustering: IncrementalDBSCAN | None = None
 
+        # maps DBSCAN cluster label → UUID of the persisted ContextBodyRecord
+        # populated when a stable in-session body is recorded to the store.
+        # used to boost resonance when collision_events report centroid convergence.
+        self._label_record_ids: dict[int, str] = {}
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
@@ -475,6 +480,10 @@ class GravitationalSampler:
                         stability=merged.stability,
                         domain=merged.domain,
                     )
+                    # the merged body inherits no DBSCAN label (label=-1),
+                    # but record its parents' labels so future collision events
+                    # between siblings of the absorbed bodies route correctly
+                    self._label_record_ids[heavy_active_idx] = str(merged_id)
                     for _, other_body, _ in self.active_bodies:
                         if isinstance(other_body, ContextBodyRecord):
                             self.body_store.record_resonance(
@@ -512,7 +521,7 @@ class GravitationalSampler:
             merged_events     — remove absorbed labels; surviving label stays
             fragmented_events — remove old label; append new fragment labels
         """
-        new_bodies, merged_events, fragmented_events = self.clustering.update(
+        new_bodies, merged_events, fragmented_events, collision_events = self.clustering.update(
             token_id, embedding, token_mass=token_mass
         )
 
@@ -531,6 +540,7 @@ class GravitationalSampler:
                     stability=body.stability,
                     domain=body.domain,
                 )
+                self._label_record_ids[label] = str(new_id)
                 # record resonance with all already-persisted co-active bodies
                 for _, other_body, _ in self.active_bodies:
                     if isinstance(other_body, ContextBodyRecord):
@@ -568,6 +578,7 @@ class GravitationalSampler:
                         stability=frag_body.stability,
                         domain=frag_body.domain,
                     )
+                    self._label_record_ids[frag_label] = str(frag_id)
                     # record resonance with all already-persisted co-active bodies
                     for _, other_body, _ in self.active_bodies:
                         if isinstance(other_body, ContextBodyRecord):
@@ -575,6 +586,18 @@ class GravitationalSampler:
                                 str(frag_id), str(other_body.id)
                             )
                 self.active_bodies.append((frag_label, frag_body, 0.0))
+
+        # near-approach collision events from DBSCAN: two cluster centroids within
+        # collision_detection_threshold but not yet DBSCAN-merged.
+        # If both bodies have been persisted to the store, boost their resonance
+        # score — they're converging semantically and co-occurrence should strengthen
+        # even before they fully merge. This primes the Lagrange midpoint force for
+        # the region between them on future tokens.
+        for label_a, label_b, _dist in collision_events:
+            rec_id_a = self._label_record_ids.get(label_a)
+            rec_id_b = self._label_record_ids.get(label_b)
+            if rec_id_a is not None and rec_id_b is not None:
+                self.body_store.record_resonance(rec_id_a, rec_id_b, increment=0.2)
 
         # check for inelastic collisions among in-session bodies after all
         # DBSCAN events have been applied this step
