@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from adaptive_g import AdaptiveG
 from context_body import ContextBody
 from context_body_record import ContextBodyRecord
 from context_body_store import ContextBodyStore
@@ -45,6 +46,10 @@ class GravitationalSampler:
                              recency weighting entirely. λ=1e-4 gives a half-life of
                              ~2 hours; λ=1e-5 gives ~19 hours. In-session ContextBody
                              objects are always treated as fully fresh (factor=1.0).
+        adaptive_g         — optional AdaptiveG instance. When provided, self.G is
+                             updated each step based on active body mass and observed
+                             escape rate. When None, G stays fixed at the constructor
+                             value. See adaptive_g.py for tuning parameters.
         domain             — static domain label used when no domain_classifier
                              is provided. Ignored if domain_classifier is set.
         domain_classifier  — optional DomainClassifier that infers the domain
@@ -62,6 +67,7 @@ class GravitationalSampler:
         amplification_threshold: float = 0.2,
         collision_distance: float = 0.1,
         recency_decay_lambda: float = 0.0,
+        adaptive_g: AdaptiveG | None = None,
         domain: str = "",
         domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -74,6 +80,7 @@ class GravitationalSampler:
         self.amplification_threshold = amplification_threshold
         self.collision_distance = collision_distance
         self.recency_decay_lambda = recency_decay_lambda
+        self.adaptive_g = adaptive_g
         self.domain = domain
         self.domain_classifier = domain_classifier
         self.device = device
@@ -354,6 +361,7 @@ class GravitationalSampler:
         # active body count but n is small; avoids recomputing for every token
         virtual_bodies = self._group_active_bodies()
 
+        escaped = 0
         for token_id in range(vocab_size):
             token_emb = token_embeddings[token_id].cpu().numpy()
             token_mass = self._compute_token_mass(token_id, weight_matrix)
@@ -370,6 +378,8 @@ class GravitationalSampler:
             # only apply bias if token exceeds escape threshold
             if force_magnitude > self.escape_threshold:
                 gravity_bias[token_id] = force_magnitude
+            else:
+                escaped += 1
 
         # add gravity bias to logits and sample
         bias_tensor = torch.tensor(gravity_bias, dtype=torch.float32).to(self.device)
@@ -384,6 +394,17 @@ class GravitationalSampler:
         # update domain inference from the new token embedding
         if self.domain_classifier is not None:
             self.domain = self.domain_classifier.update(next_emb)
+
+        # update adaptive G from this step's escape rate and body masses.
+        # G is updated *after* sampling so it influences the *next* step —
+        # a look-ahead correction rather than a same-step feedback loop.
+        if self.adaptive_g is not None:
+            escape_rate = escaped / vocab_size if vocab_size > 0 else 1.0
+            self.G = self.adaptive_g.update(
+                active_bodies=self.active_bodies,
+                escape_rate=escape_rate,
+                domain=self.domain,
+            )
 
         # compute token mass from weight norms, then update clustering
         next_token_mass = self._compute_token_mass(next_token, weight_matrix)

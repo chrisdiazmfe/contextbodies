@@ -22,6 +22,9 @@ Core concepts:
                           gravitational force computed from active bodies.
     DomainClassifier    — infers the active domain from the token embedding
                           stream via EMA context direction + nearest anchor.
+    AdaptiveG           — adaptive gravitational constant. Adjusts G each step
+                          from body mass normalization, escape rate feedback,
+                          and per-domain multipliers.
 
 Quickstart:
     from contextbodies import GravitationalSampler, ContextBodyStore
@@ -41,6 +44,7 @@ Swapping to Qdrant (production):
     store = ContextBodyStore(embedding_dim=768, backend=QdrantBackend(client))
 """
 
+from adaptive_g import AdaptiveG
 from context_body import ContextBody
 from context_body_record import ContextBodyRecord
 from context_body_store import ContextBodyStore
@@ -51,6 +55,7 @@ from orbital_state import OrbitalState
 from vector_backend import VectorBackend, FAISSBackend, QdrantBackend
 
 __all__ = [
+    "AdaptiveG",
     "ContextBody",
     "ContextBodyRecord",
     "ContextBodyStore",
