@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -20,8 +21,13 @@ class ContextBodyRecord:
     computed at query time from vector distance, not from stored foreign keys.
 
     Relationships (parent, resonance) are recovered at query time:
-        - Parent   → most similar record with an earlier created_at
-        - Resonance → records within a cosine similarity threshold at query time
+        - Parent    → most similar record with an earlier created_at
+        - Resonance → partners recorded explicitly via ContextBodyStore.record_resonance()
+
+    resonance_partners maps partner record ID (str UUID) → resonance score [0, 1].
+    Score accumulates across sessions when two bodies are co-active and decays
+    if they stop co-occurring. High-score pairs get a Lagrange midpoint force
+    in GravitationalSampler in addition to their individual forces.
 
     Contrast with ContextBody (context_body.py), which is the ephemeral in-memory
     representation used during a conversation for clustering and force computation.
@@ -36,6 +42,10 @@ class ContextBodyRecord:
     created_at: datetime = field(default_factory=datetime.utcnow)
     last_seen: datetime = field(default_factory=datetime.utcnow)
 
+    # resonance_partners: partner_record_id → score in [0, 1]
+    # populated by ContextBodyStore.record_resonance() and persisted as JSON
+    resonance_partners: dict[str, float] = field(default_factory=dict)
+
     # ------------------------------------------------------------------
     # Serialization helpers (for vector DB metadata payloads)
     # ------------------------------------------------------------------
@@ -49,11 +59,18 @@ class ContextBodyRecord:
             "domain": self.domain,
             "created_at": self.created_at.isoformat(),
             "last_seen": self.last_seen.isoformat(),
+            "resonance_partners": json.dumps(self.resonance_partners),
         }
 
     @classmethod
     def from_metadata(cls, centroid: np.ndarray, metadata: dict) -> ContextBodyRecord:
         """Reconstruct a record from a vector DB search result."""
+        raw_partners = metadata.get("resonance_partners", "{}")
+        try:
+            resonance_partners = json.loads(raw_partners) if isinstance(raw_partners, str) else raw_partners
+        except (json.JSONDecodeError, TypeError):
+            resonance_partners = {}
+
         return cls(
             id=UUID(metadata["id"]),
             centroid=centroid,
@@ -66,4 +83,5 @@ class ContextBodyRecord:
             last_seen=datetime.fromisoformat(metadata["last_seen"])
             if "last_seen" in metadata
             else datetime.utcnow(),
+            resonance_partners=resonance_partners,
         )

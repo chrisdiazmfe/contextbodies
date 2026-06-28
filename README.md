@@ -52,7 +52,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 model = AutoModelForCausalLM.from_pretrained("your-model")
 tokenizer = AutoTokenizer.from_pretrained("your-model")
 
+# In-memory (development) — no external dependencies
 store = ContextBodyStore(embedding_dim=768)
+
+# Persistent (production) — swap in Qdrant with one line
+# from contextbodies import QdrantBackend
+# from qdrant_client import QdrantClient
+# store = ContextBodyStore(embedding_dim=768, backend=QdrantBackend(
+#     QdrantClient(host="localhost", port=6333)
+# ))
+
 sampler = GravitationalSampler(
     body_store=store,
     G=1.0,                  # gravitational constant — primary tuning knob
@@ -77,6 +86,7 @@ print(text)
 | `G` | Gravitational constant. Higher = stronger context pull, less diversity | `1.0` |
 | `escape_threshold` | Minimum force magnitude to bias sampling. Tokens below this are unaffected | `0.01` |
 | `stability_threshold` | Minimum stability score for an emergent body to be persisted | `0.8` |
+| `resonance_threshold` | Minimum resonance score for a body pair to produce a Lagrange midpoint force | `0.3` |
 | `domain` | Domain label for body storage and retrieval | `""` |
 
 ## Body Persistence
@@ -108,15 +118,57 @@ contextbodies/
 ```
 torch
 numpy
-faiss-cpu  # or faiss-gpu
-pytest     # for running tests
+faiss-cpu      # or faiss-gpu
+pytest         # for running tests
+qdrant-client  # optional, only needed for QdrantBackend
 ```
 
-Install all at once:
+Install core dependencies:
 
 ```bash
 pip install torch numpy faiss-cpu pytest
 ```
+
+Install with Qdrant support:
+
+```bash
+pip install torch numpy faiss-cpu pytest qdrant-client
+```
+
+## Qdrant Setup
+
+`QdrantBackend` requires a running Qdrant instance. The fastest way to get one is via Docker:
+
+```bash
+docker run -d --name qdrant -p 6333:6333 -p 6334:6334 \
+  -v $(pwd)/qdrant_storage:/qdrant/storage \
+  qdrant/qdrant
+```
+
+This starts Qdrant on port `6333` (HTTP/gRPC) with data persisted to `./qdrant_storage`.
+
+Then connect in Python:
+
+```python
+from qdrant_client import QdrantClient
+from contextbodies import ContextBodyStore, QdrantBackend
+
+# Local server
+client = QdrantClient(host="localhost", port=6333)
+
+# Qdrant Cloud (get url and api_key from cloud.qdrant.io)
+# client = QdrantClient(url="https://your-cluster.qdrant.io", api_key="your-key")
+
+# In-memory — useful for testing, no Docker required
+# client = QdrantClient(":memory:")
+
+store = ContextBodyStore(
+    embedding_dim=768,
+    backend=QdrantBackend(client, collection_name="context_bodies"),
+)
+```
+
+The collection is created automatically on first use. Bodies written to Qdrant persist across sessions — the gravitational field accumulates knowledge over time.
 
 ## Testing
 
@@ -160,13 +212,21 @@ Early research implementation. Open issues are grouped below by area.
 - ✅ Vector-native architecture — `ContextBodyStore` refactored to a thin wrapper around a `VectorBackend` protocol. `FAISSBackend` is the default in-memory implementation. Swap to Qdrant, Pinecone, or pgvector by passing a different backend at construction.
 - ✅ `ContextBodyRecord` — lightweight persistent record (centroid + scalar metadata only). No relational fields. Serializes to/from flat vector DB payloads via `to_metadata()` / `from_metadata()`.
 - ✅ Decay scheduler — per-query trigger in `query_nearby()`. Decay runs automatically when `decay_interval` seconds have elapsed since the last run (default 60s). No background process required.
-- Production backend implementations — `QdrantBackend`, `PineconeBackend`, `PgvectorBackend` conforming to the `VectorBackend` protocol
-- `_fetch_centroid` workaround — `FAISSBackend` does not expose stored vectors in search results; production backends (Qdrant, Pinecone) return vectors directly and should eliminate this approximation
+- ✅ `QdrantBackend` — production backend backed by Qdrant. Accepts a pre-configured `QdrantClient` (local, cloud, or in-memory). Returns stored vectors in search results, which eliminates the `_fetch_centroid` approximation. Install with `pip install qdrant-client`.
+- ✅ `_fetch_centroid` workaround resolved for Qdrant — `VectorBackend.search()` now returns a fourth element `np.ndarray | None`; `ContextBodyStore.query_nearby()` uses the actual centroid when available and falls back to the approximation only for `FAISSBackend`.
+- `PineconeBackend`, `PgvectorBackend` — not yet implemented
 
 ### Physics Model
-- Body mass refinement — mass currently equals cluster density only; model weight norms are not yet factored in despite being defined in the formula (`m = W / G`)
-- Orbital resonance detection — co-present bodies that periodically reinforce each other's influence are not detected or exploited
+- ✅ Body mass refinement — body mass is now the sum of constituent token masses (`Σ ||W[token_id]|| / G`). `IncrementalDBSCAN.update()` accepts `token_mass`, stores it per point, and `_build_body()` sums them. `GravitationalSampler.sample()` computes mass from weight norms and passes it through. Prompt tokens default to `token_mass=1.0` as an approximation.
+- ✅ Orbital resonance detection — `ContextBodyRecord.resonance_partners` accumulates co-occurrence scores across sessions via `ContextBodyStore.record_resonance()`. When two resonant bodies are co-active, `GravitationalSampler._compute_resonance_forces()` adds a Lagrange midpoint force toward the semantic region between them, scaled by `sqrt(m_A * m_B) * score`. Resonance is recorded automatically when a new body is persisted alongside existing store-loaded bodies. Tunable via `resonance_threshold` (default 0.3).
 - Domain classifier — domain is passed manually at construction time; no mechanism exists to infer it from the token stream
+
+### Collision Mechanics
+- Gravitational amplification — multiple bodies near the same region in embedding space sum their forces with no awareness of each other, creating unintended gravity wells that over-pull sampling; force computation should account for body-to-body proximity
+- Inelastic collision rule — when two active bodies converge within a session, the lighter should be absorbed by the heavier with momentum exchange (centroid velocity weighted by mass ratio), rather than the current mass-average dedup which ignores velocity entirely
+- Cross-session collision — a decayed body and a new emergent body representing the same concept can coexist as separate records if their distance exceeds `dedup_distance`, doubling the gravitational influence of that concept; needs a broader re-emergence detection pass
+- Recency weighting — `last_seen` currently only drives extinction; gravitational force should be scaled by `exp(-λ * time_since_last_seen)` so temporally distant bodies exert proportionally less pull regardless of stored mass
+- Collision events — `IncrementalDBSCAN.update()` returns `new_bodies`, `merged_events`, and `fragmented_events` but no `collision_events`; converging bodies that don't fully merge are a distinct physical event worth surfacing to `GravitationalSampler`
 
 ### Clustering
 - Border-point bridge case — connectivity fragmentation BFS only walks core points; a cluster bridged solely through border points will not fragment via the structural check (bimodality may still catch it)

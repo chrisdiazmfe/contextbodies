@@ -43,6 +43,7 @@ class GravitationalSampler:
         G: float = 1.0,
         escape_threshold: float = 0.01,
         stability_threshold: float = 0.8,
+        resonance_threshold: float = 0.3,
         domain: str = "",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
@@ -50,6 +51,7 @@ class GravitationalSampler:
         self.G = G
         self.escape_threshold = escape_threshold
         self.stability_threshold = stability_threshold
+        self.resonance_threshold = resonance_threshold
         self.domain = domain
         self.device = device
 
@@ -146,6 +148,80 @@ class GravitationalSampler:
 
         return f_magnitude * r_hat
 
+    def _compute_resonance_forces(
+        self,
+        token_embedding: np.ndarray,
+        token_mass: float,
+    ) -> np.ndarray:
+        """
+        Compute Lagrange midpoint forces for co-active resonant body pairs.
+
+        When two ContextBodyRecord bodies in active_bodies have a mutual resonance
+        score above resonance_threshold, they define a Lagrange midpoint:
+
+            midpoint = (centroid_A + centroid_B) / 2
+
+        The force toward this midpoint uses the geometric mean of the two body
+        masses as the effective joint mass:
+
+            F = G * m_token * sqrt(m_A * m_B) * score / r²  ·  r̂_midpoint
+
+        This steers sampling toward tokens that bridge both resonant topics —
+        the semantic region between them — with strength proportional to how
+        consistently they've co-occurred across sessions.
+
+        Only ContextBodyRecord pairs are checked; ephemeral ContextBody objects
+        have no cross-session resonance history.
+        """
+        force = np.zeros_like(token_embedding)
+        checked_pairs: set[frozenset] = set()
+
+        for i, (_, body_a, _) in enumerate(self.active_bodies):
+            if not isinstance(body_a, ContextBodyRecord):
+                continue
+            if not body_a.resonance_partners:
+                continue
+
+            for j, (_, body_b, _) in enumerate(self.active_bodies):
+                if i >= j:
+                    continue
+                pair = frozenset({str(body_a.id), str(getattr(body_b, "id", None))})
+                if pair in checked_pairs:
+                    continue
+                checked_pairs.add(pair)
+
+                partner_id = str(getattr(body_b, "id", None))
+                if not partner_id or partner_id not in body_a.resonance_partners:
+                    continue
+
+                score = body_a.resonance_partners[partner_id]
+                if score < self.resonance_threshold:
+                    continue
+
+                # Lagrange midpoint between the two resonant body centroids
+                midpoint = (body_a.centroid + body_b.centroid) / 2.0
+                mid_norm = np.linalg.norm(midpoint)
+                if mid_norm < 1e-8:
+                    continue
+
+                # cosine distance from token to midpoint
+                r = float(1.0 - np.dot(token_embedding, midpoint) / (
+                    np.linalg.norm(token_embedding) * mid_norm + 1e-8
+                ))
+                r = max(r, 1e-8)
+
+                # joint mass = geometric mean; preserves units and scales naturally
+                joint_mass = float(np.sqrt(body_a.mass * body_b.mass))
+
+                f_magnitude = self.G * token_mass * joint_mass * score / (r ** 2)
+
+                direction = midpoint - token_embedding
+                d_norm = np.linalg.norm(direction)
+                if d_norm > 1e-8:
+                    force += f_magnitude * (direction / d_norm)
+
+        return force
+
     # ------------------------------------------------------------------
     # Sampling
     # ------------------------------------------------------------------
@@ -175,6 +251,7 @@ class GravitationalSampler:
             total_force = np.zeros_like(token_emb)
             for _, body, _ in self.active_bodies:
                 total_force += self._gravitational_force(token_emb, token_mass, body)
+            total_force += self._compute_resonance_forces(token_emb, token_mass)
 
             force_magnitude = float(np.linalg.norm(total_force))
 
@@ -192,8 +269,9 @@ class GravitationalSampler:
         next_emb = token_embeddings[next_token].cpu().numpy()
         self.orbital_state.update(next_emb)
 
-        # update clustering and record any stable emergent bodies
-        self._update_clustering(next_token, next_emb)
+        # compute token mass from weight norms, then update clustering
+        next_token_mass = self._compute_token_mass(next_token, weight_matrix)
+        self._update_clustering(next_token, next_emb, next_token_mass)
 
         return next_token
 
@@ -201,10 +279,15 @@ class GravitationalSampler:
     # Clustering maintenance
     # ------------------------------------------------------------------
 
-    def _update_clustering(self, token_id: int, embedding: np.ndarray) -> None:
+    def _update_clustering(
+        self, token_id: int, embedding: np.ndarray, token_mass: float = 1.0
+    ) -> None:
         """
         Incrementally update DBSCAN clustering with the newly sampled token.
         Keeps active_bodies in sync by tracking cluster labels alongside bodies.
+
+        token_mass — derived from ||W[token_id]|| / G; propagated into the
+                     cluster so body mass accumulates correctly from weight norms.
 
         Three events to handle:
             new_bodies        — append with their cluster label
@@ -212,7 +295,7 @@ class GravitationalSampler:
             fragmented_events — remove old label; append new fragment labels
         """
         new_bodies, merged_events, fragmented_events = self.clustering.update(
-            token_id, embedding
+            token_id, embedding, token_mass=token_mass
         )
 
         # new cluster formed — append
@@ -224,13 +307,18 @@ class GravitationalSampler:
                 -1,
             )
             if body.stability >= self.stability_threshold:
-                # persist centroid + scalars only — no relational data
-                self.body_store.record(
+                new_id = self.body_store.record(
                     centroid=body.centroid,
                     mass=body.mass,
                     stability=body.stability,
                     domain=body.domain,
                 )
+                # record resonance with all already-persisted co-active bodies
+                for _, other_body, _ in self.active_bodies:
+                    if isinstance(other_body, ContextBodyRecord):
+                        self.body_store.record_resonance(
+                            str(new_id), str(other_body.id)
+                        )
             self.active_bodies.append((label, body, 0.0))
 
         # merge — remove absorbed labels (surviving label's body centroid
@@ -256,10 +344,16 @@ class GravitationalSampler:
                     -1,
                 )
                 if frag_body.stability >= self.stability_threshold:
-                    self.body_store.record(
+                    frag_id = self.body_store.record(
                         centroid=frag_body.centroid,
                         mass=frag_body.mass,
                         stability=frag_body.stability,
                         domain=frag_body.domain,
                     )
+                    # record resonance with all already-persisted co-active bodies
+                    for _, other_body, _ in self.active_bodies:
+                        if isinstance(other_body, ContextBodyRecord):
+                            self.body_store.record_resonance(
+                                str(frag_id), str(other_body.id)
+                            )
                 self.active_bodies.append((frag_label, frag_body, 0.0))

@@ -105,6 +105,7 @@ class IncrementalDBSCAN:
         # per-point state
         self.embeddings: list[np.ndarray] = []
         self.token_ids: list[int] = []
+        self.token_masses: list[float] = []  # weight-norm-derived mass per token
         self.labels: list[int] = []          # -1 = noise / unassigned
         self.point_types: list[PointType] = []
 
@@ -534,9 +535,16 @@ class IncrementalDBSCAN:
         self,
         token_id: int,
         embedding: np.ndarray,
+        token_mass: float = 1.0,
     ) -> tuple[list[ContextBody], list[tuple[int, int]], list[tuple[int, list[ContextBody]]]]:
         """
         Add a new token and update cluster state.
+
+        token_mass — physical mass of this token, derived from model weight norms
+                     via ||W[token_id]|| / G. Defaults to 1.0 when the weight
+                     matrix is unavailable (e.g. prompt seeding in initialize()).
+                     Body mass is the sum of its constituent token masses, so
+                     bodies built from high-weight tokens are proportionally heavier.
 
         Returns:
             new_bodies        — ContextBody objects for any newly formed clusters
@@ -547,6 +555,7 @@ class IncrementalDBSCAN:
         idx = len(self.embeddings)
         self.embeddings.append(embedding)
         self.token_ids.append(token_id)
+        self.token_masses.append(token_mass)
         self.labels.append(-1)            # placeholder
         self.point_types.append("noise")  # placeholder
 
@@ -629,7 +638,15 @@ class IncrementalDBSCAN:
         return new_bodies, merged_events, fragmented_events
 
     def _build_body(self, label: int) -> ContextBody:
-        """Construct a ContextBody snapshot from a cluster's current state."""
+        """
+        Construct a ContextBody snapshot from a cluster's current state.
+
+        mass    — sum of constituent token masses (||W[token_id]|| / G).
+                  Falls back to 1.0 per token for points seeded without a weight
+                  matrix (e.g. prompt tokens in initialize()).
+        density — geometric density: token count / total embedding variance.
+                  Kept separate from mass so both signals remain available.
+        """
         indices = list(self.clusters[label])
         embs = np.array([self.embeddings[i] for i in indices])
         tokens = [self.token_ids[i] for i in indices]
@@ -638,13 +655,21 @@ class IncrementalDBSCAN:
 
         density = float(n / (np.var(embs).sum() + 1e-8))
 
+        # body mass = sum of constituent token masses
+        # falls back to 1.0 for tokens added before token_masses was populated
+        # (e.g. via seed_cluster in tests or legacy callers)
+        mass = sum(
+            self.token_masses[i] if i < len(self.token_masses) else 1.0
+            for i in indices
+        )
+
         return ContextBody(
             centroid=centroid.copy(),
             centroid_velocity=np.zeros_like(centroid),
             covariance=(
                 np.cov(embs.T) if n > 1 else np.eye(embs.shape[1])
             ),
-            mass=density,
+            mass=mass,
             density=density,
             stability=float(self.stabilities.get(label, 0.5)),
             member_tokens=set(tokens),

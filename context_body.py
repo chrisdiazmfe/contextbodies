@@ -50,10 +50,19 @@ class ContextBody:
     # Relationships across sessions are recovered at query time via similarity
     parent_ids: list[UUID] = field(default_factory=list)
 
-    def accrete(self, token_id: int, token_embedding: np.ndarray) -> None:
+    def accrete(
+        self,
+        token_id: int,
+        token_embedding: np.ndarray,
+        token_mass: float = 1.0,
+    ) -> None:
         """
-        Add a new token to this body, updating centroid and density.
+        Add a new token to this body, updating centroid and mass.
         Analogous to a body gaining mass from nearby matter.
+
+        token_mass — physical mass of the incoming token, derived from model
+                     weight norms via ||W[token_id]|| / G. Defaults to 1.0
+                     when the weight matrix is unavailable.
         """
         n = len(self.member_tokens)
         self.member_tokens.add(token_id)
@@ -61,6 +70,8 @@ class ContextBody:
         prev_centroid = self.centroid.copy()
         self.centroid = (self.centroid * n + token_embedding) / (n + 1)
         self.centroid_velocity = self.centroid - prev_centroid
+
+        self.mass += token_mass
 
         r = float(1 - np.dot(token_embedding, self.centroid) / (
             np.linalg.norm(token_embedding) * np.linalg.norm(self.centroid) + 1e-8

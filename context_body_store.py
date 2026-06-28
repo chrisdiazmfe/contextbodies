@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -52,6 +53,11 @@ class ContextBodyStore:
         # (avoids a full scan of the backend on every decay call)
         self._record_last_seen: dict[str, datetime] = {}
         self._record_mass: dict[str, float] = {}
+
+        # resonance cache: record_id → {partner_id → score}
+        # lazily populated from backend metadata when records are loaded or recorded.
+        # write-through: every record_resonance() call updates both cache and backend.
+        self._resonance_cache: dict[str, dict[str, float]] = {}
 
         # per-query decay trigger — last time decay() was run automatically
         self._last_decay_at: datetime | None = None
@@ -143,14 +149,16 @@ class ContextBodyStore:
         )
 
         results = []
-        for record_id, cosine_dist, metadata in raw:
+        for record_id, cosine_dist, metadata, stored_vector in raw:
             if float(metadata.get("mass", 0.0)) < mass_threshold:
                 continue
-            # reconstruct the centroid from the backend's stored vector
-            # by re-searching at k=1 for this specific record — backends that
-            # return vectors directly (Qdrant, Pinecone) can override this
-            centroid = self._fetch_centroid(record_id, embedding)
+            # use the stored centroid if the backend returned it (Qdrant, Pinecone);
+            # fall back to the query-vector approximation for FAISSBackend
+            centroid = stored_vector if stored_vector is not None else self._fetch_centroid(record_id, embedding)
             rec = ContextBodyRecord.from_metadata(centroid, metadata)
+            # populate resonance cache from persisted metadata (write-through on load)
+            if rec.resonance_partners:
+                self._resonance_cache[record_id] = dict(rec.resonance_partners)
             results.append((rec, cosine_dist))
 
         # rank by gravitational influence
@@ -192,6 +200,34 @@ class ContextBodyStore:
                 self._record_mass.pop(rid, None)
 
         return extinct_uuids
+
+    def record_resonance(
+        self,
+        id_a: str,
+        id_b: str,
+        increment: float = 0.1,
+        max_score: float = 1.0,
+    ) -> None:
+        """
+        Record that two bodies were co-active in the same session.
+
+        Increments the resonance score between id_a and id_b by `increment`
+        (default 0.1), capped at max_score. Scores accumulate across sessions,
+        so bodies that consistently co-occur converge toward 1.0 and gain a
+        Lagrange midpoint force term in GravitationalSampler.
+
+        Write-through: both the local cache and the backend metadata are updated
+        immediately so scores survive store restarts.
+        """
+        for self_id, partner_id in [(id_a, id_b), (id_b, id_a)]:
+            partners = self._resonance_cache.setdefault(self_id, {})
+            partners[partner_id] = min(
+                partners.get(partner_id, 0.0) + increment,
+                max_score,
+            )
+            self.backend.update_metadata(
+                self_id, {"resonance_partners": json.dumps(partners)}
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers

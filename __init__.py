@@ -31,11 +31,12 @@ Quickstart:
     text = generate(model, tokenizer, prompt="Tell me about transformers",
                     sampler=sampler, max_tokens=200)
 
-Swapping to a production vector DB:
-    from contextbodies import ContextBodyStore
-    from my_backends import QdrantBackend
+Swapping to Qdrant (production):
+    from contextbodies import ContextBodyStore, QdrantBackend
+    from qdrant_client import QdrantClient
 
-    store = ContextBodyStore(embedding_dim=768, backend=QdrantBackend(...))
+    client = QdrantClient(host="localhost", port=6333)
+    store = ContextBodyStore(embedding_dim=768, backend=QdrantBackend(client))
 """
 
 from context_body import ContextBody
@@ -44,7 +45,7 @@ from context_body_store import ContextBodyStore
 from gravitational_sampler import GravitationalSampler
 from incremental_dbscan import IncrementalDBSCAN
 from orbital_state import OrbitalState
-from vector_backend import VectorBackend, FAISSBackend
+from vector_backend import VectorBackend, FAISSBackend, QdrantBackend
 
 __all__ = [
     "ContextBody",
@@ -54,5 +55,6 @@ __all__ = [
     "GravitationalSampler",
     "IncrementalDBSCAN",
     "OrbitalState",
+    "QdrantBackend",
     "VectorBackend",
 ]

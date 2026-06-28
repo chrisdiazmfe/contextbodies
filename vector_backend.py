@@ -19,11 +19,16 @@ class VectorBackend(Protocol):
 
     Implementations must support:
         upsert          — insert or update a record by ID
-        search          — ANN search returning (id, cosine_distance, metadata)
+        search          — ANN search returning (id, cosine_distance, metadata, vector|None)
         delete          — remove records by ID
         update_metadata — patch scalar metadata on an existing record
 
-    Intended backends: FAISSBackend (default), Qdrant, Pinecone, Weaviate, pgvector.
+    The optional fourth element of each search result is the stored centroid vector.
+    Backends that return vectors (Qdrant, Pinecone) populate it; FAISSBackend returns
+    None. ContextBodyStore uses it to eliminate the _fetch_centroid approximation when
+    available.
+
+    Intended backends: FAISSBackend (default), QdrantBackend, PineconeBackend, pgvector.
     Swap by passing a different backend to ContextBodyStore.__init__.
     """
 
@@ -39,10 +44,11 @@ class VectorBackend(Protocol):
         vector: np.ndarray,
         k: int,
         filter: dict | None = None,
-    ) -> list[tuple[str, float, dict]]:
+    ) -> list[tuple[str, float, dict, np.ndarray | None]]:
         """
-        Returns up to k results as (record_id, cosine_distance, metadata) triples,
+        Returns up to k results as (record_id, cosine_distance, metadata, stored_vector)
         sorted by distance ascending (nearest first).
+        stored_vector is None for backends that don't return vectors in search results.
         filter is a dict of metadata equality constraints, e.g. {"domain": "ml"}.
         """
         ...
@@ -143,9 +149,12 @@ class FAISSBackend:
         vector: np.ndarray,
         k: int,
         filter: dict | None = None,
-    ) -> list[tuple[str, float, dict]]:
+    ) -> list[tuple[str, float, dict, np.ndarray | None]]:
         """
-        Return up to k nearest records as (record_id, cosine_distance, metadata).
+        Return up to k nearest records as (record_id, cosine_distance, metadata, None).
+
+        The fourth element is always None — FAISSBackend does not return stored vectors
+        in search results. ContextBodyStore falls back to _fetch_centroid in this case.
 
         Oversamples by 2× then applies metadata filter, so the effective k
         may be lower than requested if many records are filtered out.
@@ -169,7 +178,7 @@ class FAISSBackend:
             if not self._matches_filter(meta, filter):
                 continue
             cosine_dist = float(1.0 - sim)
-            results.append((record_id, cosine_dist, meta))
+            results.append((record_id, cosine_dist, meta, None))
             if len(results) >= k:
                 break
 
@@ -198,3 +207,147 @@ class FAISSBackend:
     @property
     def size(self) -> int:
         return self.index.ntotal
+
+
+# ---------------------------------------------------------------------------
+# QdrantBackend — production backend backed by Qdrant
+# ---------------------------------------------------------------------------
+
+class QdrantBackend:
+    """
+    Vector backend backed by Qdrant.
+
+    Accepts a pre-configured QdrantClient so any deployment variant works:
+        Local server:  QdrantClient(host="localhost", port=6333)
+        Qdrant Cloud:  QdrantClient(url="https://...", api_key="...")
+        In-memory:     QdrantClient(":memory:")   ← useful for testing
+
+    Unlike FAISSBackend, Qdrant returns stored vectors in search results, so
+    ContextBodyStore can use the actual centroid instead of the query-vector
+    approximation in _fetch_centroid. The fourth element of each search result
+    is the stored np.ndarray rather than None.
+
+    The collection is created automatically on first use if it does not exist.
+    Cosine distance is used to match the rest of the system.
+
+    Install the client:
+        pip install qdrant-client
+    """
+
+    def __init__(
+        self,
+        client,                              # qdrant_client.QdrantClient
+        collection_name: str = "context_bodies",
+        embedding_dim: int = 768,
+    ):
+        self.client = client
+        self.collection_name = collection_name
+        self.embedding_dim = embedding_dim
+        self._ensure_collection()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_collection(self) -> None:
+        """Create the collection if it does not already exist."""
+        from qdrant_client.models import Distance, VectorParams
+
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.collection_name not in existing:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=self.embedding_dim,
+                    distance=Distance.COSINE,
+                ),
+            )
+
+    @staticmethod
+    def _build_filter(filter: dict | None):
+        """Convert a flat equality dict to a Qdrant Filter object."""
+        if not filter:
+            return None
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        return Filter(
+            must=[
+                FieldCondition(key=k, match=MatchValue(value=v))
+                for k, v in filter.items()
+            ]
+        )
+
+    # ------------------------------------------------------------------
+    # VectorBackend interface
+    # ------------------------------------------------------------------
+
+    def upsert(
+        self,
+        record_id: str,
+        vector: np.ndarray,
+        metadata: dict,
+    ) -> None:
+        from qdrant_client.models import PointStruct
+
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=[
+                PointStruct(
+                    id=record_id,
+                    vector=vector.astype(np.float32).tolist(),
+                    payload=metadata,
+                )
+            ],
+        )
+
+    def search(
+        self,
+        vector: np.ndarray,
+        k: int,
+        filter: dict | None = None,
+    ) -> list[tuple[str, float, dict, np.ndarray | None]]:
+        """
+        Return up to k nearest records as (record_id, cosine_distance, metadata, centroid).
+
+        Qdrant returns cosine similarity in [-1, 1]; we convert to cosine distance
+        via 1 - score so results are consistent with FAISSBackend.
+        The stored centroid vector is returned directly, eliminating the
+        _fetch_centroid approximation used by FAISSBackend.
+        """
+        results = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=vector.astype(np.float32).tolist(),
+            query_filter=self._build_filter(filter),
+            limit=k,
+            with_payload=True,
+            with_vectors=True,
+        )
+
+        return [
+            (
+                str(r.id),
+                float(1.0 - r.score),
+                r.payload or {},
+                np.array(r.vector, dtype=np.float32) if r.vector is not None else None,
+            )
+            for r in results
+        ]
+
+    def delete(self, record_ids: list[str]) -> None:
+        from qdrant_client.models import PointIdsList
+
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=PointIdsList(points=record_ids),
+        )
+
+    def update_metadata(self, record_id: str, metadata: dict) -> None:
+        self.client.set_payload(
+            collection_name=self.collection_name,
+            payload=metadata,
+            points=[record_id],
+        )
+
+    @property
+    def size(self) -> int:
+        return self.client.count(collection_name=self.collection_name).count
