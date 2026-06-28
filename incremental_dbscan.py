@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Literal
 
 import numpy as np
@@ -237,12 +238,39 @@ class IncrementalDBSCAN:
 
     def _connected_components(self, label: int) -> list[set[int]]:
         """
-        Find connected components in the eps-neighborhood graph restricted to
-        the cluster's core points.
+        Find connected components in the eps-neighborhood graph, accounting for
+        border-point bridges.
 
-        Two core points are connected if they are within eps of each other.
-        Border points are not part of the graph — they are assigned afterward
-        to the nearest component centroid.
+        Two-phase algorithm:
+
+        Phase 1 — core-only BFS:
+            Build an adjacency graph over core points only (two core points are
+            adjacent if within eps of each other). BFS produces a set of core
+            components. If there is only one, the cluster is intact.
+
+        Phase 2 — border bridge check:
+            Before committing to fragmentation, check whether any border point
+            has eps-neighbors in two or more of the discovered core components.
+            Such a border point is a *bridge* — a token at the semantic boundary
+            between two dense concept regions. Bridges are merged via union-find
+            so that two core regions connected through a border point are NOT
+            fragmented, even though they have no direct core-to-core eps link.
+
+        Rationale for including border bridges:
+            In strict DBSCAN, border points do not establish density-connectivity,
+            so two core regions linked only through a border point are separate
+            clusters. In contextbodies, a border token at the intersection of two
+            concepts is a genuine semantic signal — fragmenting on that boundary
+            discards it and produces two small low-mass bodies instead of one
+            coherent body that spans the concept transition. The border-bridge
+            check preserves this signal.
+
+            True fragmentation — where two regions have no eps path between them
+            at all, even through border points — is correctly detected because no
+            border point will be adjacent to both disconnected components.
+
+        Border points are assigned to their nearest surviving component centroid
+        after the bridge check resolves the final component set.
 
         Returns a list of point-index sets, one per component.
         If len == 1, the cluster is still fully connected (no fragmentation).
@@ -250,12 +278,14 @@ class IncrementalDBSCAN:
         members = list(self.clusters[label])
         member_set = set(members)
         core_members = [i for i in members if self.point_types[i] == "core"]
+        border_members = [i for i in members if self.point_types[i] != "core"]
 
         if len(core_members) < 2:
-            # can't split with fewer than 2 core points
             return [member_set]
 
-        # build adjacency list among core members using FAISS
+        # ------------------------------------------------------------------
+        # Phase 1: core-only BFS
+        # ------------------------------------------------------------------
         core_set = set(core_members)
         adjacency: dict[int, list[int]] = {i: [] for i in core_members}
 
@@ -265,7 +295,6 @@ class IncrementalDBSCAN:
                 if n in core_set:
                     adjacency[idx].append(n)
 
-        # BFS over core members to find connected components
         visited: set[int] = set()
         core_components: list[set[int]] = []
 
@@ -286,14 +315,64 @@ class IncrementalDBSCAN:
         if len(core_components) == 1:
             return [member_set]
 
-        # assign border points to the nearest component centroid
+        # ------------------------------------------------------------------
+        # Phase 2: border bridge check — union-find over core components
+        # ------------------------------------------------------------------
+        # Map each core point → its component index
+        point_to_comp: dict[int, int] = {}
+        for ci, comp in enumerate(core_components):
+            for pt in comp:
+                point_to_comp[pt] = ci
+
+        # Union-Find with path compression
+        parent = list(range(len(core_components)))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(x: int, y: int) -> None:
+            px, py = _find(x), _find(y)
+            if px != py:
+                parent[px] = py
+
+        for border_idx in border_members:
+            neighbors = self._find_neighbors(
+                self.embeddings[border_idx], exclude_idx=border_idx
+            )
+            # which core components does this border point touch?
+            touched = {
+                point_to_comp[n]
+                for n in neighbors
+                if n in point_to_comp
+            }
+            touched_list = list(touched)
+            # bridge: merge all touched components into one
+            for k in range(1, len(touched_list)):
+                _union(touched_list[0], touched_list[k])
+
+        # Rebuild component sets under the merged roots
+        merged: dict[int, set[int]] = defaultdict(set)
+        for ci, comp in enumerate(core_components):
+            merged[_find(ci)].update(comp)
+
+        surviving_core_components = list(merged.values())
+
+        if len(surviving_core_components) == 1:
+            # all disconnected core regions were bridged — no fragmentation
+            return [member_set]
+
+        # ------------------------------------------------------------------
+        # Assign border points to the nearest surviving component centroid
+        # ------------------------------------------------------------------
         component_centroids = [
             np.array([self.embeddings[i] for i in comp]).mean(axis=0)
-            for comp in core_components
+            for comp in surviving_core_components
         ]
 
-        full_components: list[set[int]] = [set(c) for c in core_components]
-        border_members = [i for i in members if self.point_types[i] != "core"]
+        full_components: list[set[int]] = [set(c) for c in surviving_core_components]
 
         for border_idx in border_members:
             emb = self.embeddings[border_idx]

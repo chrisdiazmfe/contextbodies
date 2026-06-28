@@ -285,7 +285,7 @@ Early research implementation. Open issues are grouped below by area.
 - ✅ Collision events — `IncrementalDBSCAN.update()` now returns a 4th value: `collision_events: list[tuple[int, int, float]]` — cluster label pairs whose centroids are within `collision_detection_threshold` (default 0.2) but have not been DBSCAN-merged this step. These are near-approach events: clusters converging semantically but still structurally separate. `GravitationalSampler._update_clustering()` consumes them and boosts resonance (increment=0.2) for any pair where both bodies have been persisted to the store, priming the Lagrange midpoint force for the region between them before full merger occurs.
 
 ### Clustering
-- Border-point bridge case — connectivity fragmentation BFS only walks core points; a cluster bridged solely through border points will not fragment via the structural check (bimodality may still catch it)
+- ✅ Border-point bridge case — `_connected_components` now runs a two-phase algorithm. Phase 1: core-only BFS (original behavior). Phase 2: union-find over the resulting core components, merging any two components that share a border-point bridge (a border point with eps-neighbors in both). Core regions connected through a border point are preserved as one cluster; only regions with no eps path between them at all — even through border points — are fragmented. This retains the semantic signal of tokens at concept boundaries rather than discarding them as fragmentation artifacts.
 
 ### Evaluation
 - Benchmarking — no evaluation harness against temperature / top-p baselines; suggested metrics: perplexity, MAUVE, distinct-n, KL divergence from baseline distribution
