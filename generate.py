@@ -36,9 +36,8 @@ def generate(
 
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
-    # embedding and output weight matrices (retrieved once, reused every step)
+    # embedding matrix retrieved once, reused every step
     token_embeddings = model.get_input_embeddings().weight   # [vocab, D]
-    weight_matrix = model.get_output_embeddings().weight     # [vocab, D]
     embedding_dim = token_embeddings.shape[1]
 
     # initialize sampler with prompt context
@@ -57,7 +56,6 @@ def generate(
         next_token = sampler.sample(
             logits=logits,
             token_embeddings=token_embeddings,
-            weight_matrix=weight_matrix,
         )
 
         generated.append(next_token)
