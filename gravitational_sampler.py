@@ -57,6 +57,8 @@ class GravitationalSampler:
         domain: str = "",
         domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        dbscan_eps: float = 0.3,
+        dbscan_min_samples: int = 3,
     ):
         self.body_store = body_store
         self.G = G
@@ -84,6 +86,13 @@ class GravitationalSampler:
         # escape rate tracking
         self._last_escape_count: int = 0
         self._last_vocab_size: int = 0
+        self.dbscan_eps = dbscan_eps
+        self.dbscan_min_samples = dbscan_min_samples
+
+        # Cached numpy copy of the vocab embedding matrix.
+        # Populated on first sample() call; avoids a ~154MB GPU→CPU copy every step.
+        self._cached_token_embs_np: np.ndarray | None = None
+        self._cached_token_embs_id: int = -1
 
     # ------------------------------------------------------------------
     # Initialization
@@ -107,8 +116,8 @@ class GravitationalSampler:
         self.orbital_state = OrbitalState.initialize(initial_pos)
 
         self.clustering = IncrementalDBSCAN(
-            eps=0.1,
-            min_samples=5,
+            eps=self.dbscan_eps,
+            min_samples=self.dbscan_min_samples,
             dim=embedding_dim,
         )
 
@@ -342,7 +351,13 @@ class GravitationalSampler:
         Returns integer token index in [0, vocab_size).
         """
         vocab_size = logits.shape[0]
-        embs_np = token_embeddings.cpu().numpy()  # [vocab_size, D]
+        # Cache the numpy embedding matrix — it doesn't change across steps,
+        # but copying 50k × 768 floats from GPU every call costs ~150ms/step.
+        emb_id = id(token_embeddings)
+        if self._cached_token_embs_id != emb_id or self._cached_token_embs_np is None:
+            self._cached_token_embs_np = token_embeddings.detach().cpu().numpy()
+            self._cached_token_embs_id = emb_id
+        embs_np = self._cached_token_embs_np  # [vocab_size, D]
 
         # Get virtual body groups
         groups = self._group_active_bodies()

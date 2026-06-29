@@ -295,6 +295,10 @@ def parse_args() -> argparse.Namespace:
                    help="Enable AdaptiveG controller")
     p.add_argument("--recency-lambda", type=float, default=0.0,
                    help="Recency decay lambda (default: 0.0 = disabled)")
+    p.add_argument("--dbscan-eps", type=float, default=0.3,
+                   help="DBSCAN epsilon: cosine distance radius for cluster membership (default: 0.3)")
+    p.add_argument("--dbscan-min-samples", type=int, default=3,
+                   help="DBSCAN min_samples: tokens needed to form a cluster core (default: 3)")
     p.add_argument("--output", default="benchmark_results",
                    help="Output directory (default: benchmark_results)")
     p.add_argument("--device", default=None,
@@ -327,7 +331,8 @@ def main() -> None:
         prompts = DEFAULT_PROMPTS
 
     print(f"Prompts: {len(prompts)}  |  max_tokens: {args.max_tokens}  |  runs: {args.runs}")
-    print(f"G={args.G}  temperature={args.temperature}  adaptive_g={args.adaptive_g}\n")
+    print(f"G={args.G}  temperature={args.temperature}  adaptive_g={args.adaptive_g}")
+    print(f"dbscan_eps={args.dbscan_eps}  dbscan_min_samples={args.dbscan_min_samples}\n")
 
     # Output dir
     out_dir = Path(args.output)
@@ -396,6 +401,8 @@ def main() -> None:
                 recency_decay_lambda=args.recency_lambda,
                 adaptive_g=adaptive_g,
                 device=device,
+                dbscan_eps=args.dbscan_eps,
+                dbscan_min_samples=args.dbscan_min_samples,
             )
 
             text, elapsed, step_mets = generate_gravitational(
