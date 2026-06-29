@@ -33,28 +33,14 @@ class GravitationalSampler:
         6. Record any newly stabilized emergent bodies to the store.
 
     Key parameters:
-        G                  — gravitational constant; primary tuning knob.
-                             Larger G = stronger context pull, less diversity.
-        escape_threshold   — minimum force magnitude to influence sampling.
-                             Tokens below this threshold are unaffected
-                             (they have "escape velocity" from all bodies).
-        stability_threshold — minimum stability score for a body to be persisted.
-        resonance_threshold — minimum resonance score for a Lagrange midpoint force.
-        recency_decay_lambda — time-decay rate λ for persisted bodies. Force from
-                             a ContextBodyRecord is scaled by exp(-λ * elapsed_seconds)
-                             where elapsed = now - last_seen. λ=0.0 (default) disables
-                             recency weighting entirely. λ=1e-4 gives a half-life of
-                             ~2 hours; λ=1e-5 gives ~19 hours. In-session ContextBody
-                             objects are always treated as fully fresh (factor=1.0).
-        adaptive_g         — optional AdaptiveG instance. When provided, self.G is
-                             updated each step based on active body mass and observed
-                             escape rate. When None, G stays fixed at the constructor
-                             value. See adaptive_g.py for tuning parameters.
-        domain             — static domain label used when no domain_classifier
-                             is provided. Ignored if domain_classifier is set.
-        domain_classifier  — optional DomainClassifier that infers the domain
-                             from the token stream. When provided, self.domain
-                             is updated automatically on every generated token.
+        G                  -- gravitational constant; primary tuning knob.
+        escape_threshold   -- minimum force magnitude to influence sampling.
+        stability_threshold -- minimum stability score for a body to be persisted.
+        resonance_threshold -- minimum resonance score for a Lagrange midpoint force.
+        recency_decay_lambda -- time-decay rate lambda for persisted bodies.
+        adaptive_g         -- optional AdaptiveG instance.
+        domain             -- static domain label used when no domain_classifier.
+        domain_classifier  -- optional DomainClassifier.
     """
 
     def __init__(
@@ -92,10 +78,12 @@ class GravitationalSampler:
         self.active_bodies: list[tuple[int, _GravitySource, float]] = []
         self.clustering: IncrementalDBSCAN | None = None
 
-        # maps DBSCAN cluster label → UUID of the persisted ContextBodyRecord
-        # populated when a stable in-session body is recorded to the store.
-        # used to boost resonance when collision_events report centroid convergence.
+        # maps DBSCAN cluster label -> UUID of the persisted ContextBodyRecord
         self._label_record_ids: dict[int, str] = {}
+
+        # escape rate tracking
+        self._last_escape_count: int = 0
+        self._last_vocab_size: int = 0
 
     # ------------------------------------------------------------------
     # Initialization
@@ -109,14 +97,10 @@ class GravitationalSampler:
         """
         Seed the sampler from the prompt context.
         Loads relevant recorded bodies and initializes orbital state + clustering.
-
-        If a domain_classifier was provided, seeds it from the prompt embeddings
-        so the initial domain is inferred rather than hard-coded.
         """
-        embs_np = context_embeddings.cpu().numpy()   # [context_len, D]
+        embs_np = context_embeddings.cpu().numpy()
         initial_pos = embs_np[0]
 
-        # infer domain from the full prompt if a classifier is available
         if self.domain_classifier is not None:
             self.domain = self.domain_classifier.seed(embs_np)
 
@@ -128,13 +112,9 @@ class GravitationalSampler:
             dim=embedding_dim,
         )
 
-        # seed clustering with all prompt tokens
         for i in range(context_embeddings.shape[0]):
             self.clustering.update(token_id=-i, embedding=embs_np[i])
 
-        # load relevant recorded bodies from the store using the (now inferred) domain
-        # query_nearby returns ContextBodyRecord objects — label=-1 marks them
-        # as store-sourced so _update_clustering doesn't try to remove them
         self.active_bodies = [
             (-1, record, dist)
             for record, dist in self.body_store.query_nearby(
@@ -151,11 +131,7 @@ class GravitationalSampler:
     def _compute_token_mass(
         self, token_id: int, weight_matrix: torch.Tensor
     ) -> float:
-        """
-        Derive token mass from model weight norms.
-            m = W / G
-        where W is the L2 norm of the token's row in the output embedding matrix.
-        """
+        """Derive token mass from model weight norms: m = ||W[token_id]|| / G."""
         weight_norm = torch.norm(weight_matrix[token_id]).item()
         return weight_norm / self.G
 
@@ -167,95 +143,86 @@ class GravitationalSampler:
         body_mass: float,
     ) -> np.ndarray:
         """
-        Compute gravitational force vector on a token from a body (or virtual body).
+        Compute gravitational force vector on a token from a body.
 
-            F = G * (m_token * m_body) / r²  ·  r̂
+            F = G * (m_token * m_body) / r^2  *  r_hat
 
-        Accepts centroid and mass directly so the same formula works for both
-        individual active bodies and mass-weighted virtual groups produced by
-        _group_active_bodies().
-
-        Distance r is cosine distance (angle-based), appropriate for embedding
-        spaces where semantics live in direction rather than magnitude.
-        Force vector points toward the body centroid.
+        Distance r is cosine distance. Force vector points toward body centroid.
         """
-        r_vec = token_embedding - body_centroid
-
-        r = float(1.0 - np.dot(token_embedding, body_centroid) / (
-            np.linalg.norm(token_embedding) * np.linalg.norm(body_centroid) + 1e-8
+        direction = body_centroid - token_embedding
+        r = float(1.0 - np.dot(
+            token_embedding / (np.linalg.norm(token_embedding) + 1e-8),
+            body_centroid / (np.linalg.norm(body_centroid) + 1e-8),
         ))
-        r = max(r, 1e-8)
-
-        f_magnitude = self.G * (token_mass * body_mass) / (r ** 2)
-
-        r_norm = np.linalg.norm(r_vec)
-        r_hat = -r_vec / (r_norm + 1e-8)
-
-        return f_magnitude * r_hat
+        r = max(r, 1e-6)  # avoid division by zero
+        magnitude = self.G * token_mass * body_mass / (r ** 2)
+        dir_norm = np.linalg.norm(direction)
+        if dir_norm < 1e-8:
+            return np.zeros_like(token_embedding)
+        return magnitude * direction / dir_norm
 
     def _recency_factor(self, body: _GravitySource) -> float:
         """
-        Time-decay weight for a body: exp(-λ * elapsed_seconds).
+        Recency decay factor for a gravity source.
 
-        Returns 1.0 for:
-            - in-session ContextBody objects (always fresh, no last_seen)
-            - any body when recency_decay_lambda == 0.0 (feature disabled)
-
-        For ContextBodyRecord, elapsed is seconds since last_seen. This scales
-        gravitational force continuously — a body seen 2 hours ago with λ=1e-4
-        retains ~70% force; one unseen for a week retains less than 2%.
-
-        The product of two records' factors is used for resonance pairs so that
-        a resonance force requires *both* bodies to have been recently active.
+        ContextBody (in-session): always 1.0.
+        ContextBodyRecord: exp(-lambda * elapsed_seconds).
+        lambda=0.0 disables decay (always 1.0).
         """
-        if self.recency_decay_lambda <= 0.0 or not isinstance(body, ContextBodyRecord):
+        if isinstance(body, ContextBody):
+            return 1.0
+        if self.recency_decay_lambda == 0.0:
             return 1.0
         elapsed = (datetime.utcnow() - body.last_seen).total_seconds()
         return float(np.exp(-self.recency_decay_lambda * elapsed))
 
-    def _group_active_bodies(self) -> list[tuple[np.ndarray, float]]:
+    def _group_active_bodies(
+        self,
+    ) -> list[tuple[np.ndarray, float]]:
         """
-        Group active bodies within amplification_threshold of each other into
-        virtual bodies, each with a mass-weighted centroid and summed mass.
+        Group nearby active bodies into virtual bodies for amplified force.
 
-        This prevents gravitational amplification — the unintended gravity well
-        that forms when multiple bodies cluster near the same concept and their
-        forces sum independently. A single body of mass Σmᵢ at the mass-weighted
-        centroid is the physically correct representation.
-
-        Uses greedy single-pass grouping: each body joins the first existing group
-        whose centroid is within amplification_threshold (cosine distance), or
-        starts a new group if none qualifies. O(n²) in active body count, which
-        is typically small (<50).
-
-        Returns (virtual_centroid, total_mass) pairs — one per group.
+        Bodies within amplification_threshold cosine distance of each other
+        are merged into a single virtual body with summed mass (weighted by
+        recency factor). Returns list of (centroid, effective_mass) pairs.
         """
-        groups: list[list] = []  # [[centroid, mass], ...]
+        if not self.active_bodies:
+            return []
 
-        for _, body, _ in self.active_bodies:
-            centroid = body.centroid
-            mass = body.mass * self._recency_factor(body)
-            if mass <= 0.0:
-                continue  # fully decayed — skip without contributing to any group
-            placed = False
+        sources = [
+            (body, self._recency_factor(body))
+            for _, body, _ in self.active_bodies
+        ]
 
-            for group in groups:
-                g_centroid, g_mass = group
-                r = float(1.0 - np.dot(centroid, g_centroid) / (
-                    np.linalg.norm(centroid) * np.linalg.norm(g_centroid) + 1e-8
-                ))
-                if r < self.amplification_threshold:
+        used = [False] * len(sources)
+        groups: list[tuple[np.ndarray, float]] = []
+
+        for i, (body_i, factor_i) in enumerate(sources):
+            if used[i]:
+                continue
+            used[i] = True
+            group_centroid = body_i.centroid.copy()
+            group_mass = body_i.mass * factor_i
+
+            for j, (body_j, factor_j) in enumerate(sources):
+                if used[j] or i == j:
+                    continue
+                ci = body_i.centroid / (np.linalg.norm(body_i.centroid) + 1e-8)
+                cj = body_j.centroid / (np.linalg.norm(body_j.centroid) + 1e-8)
+                dist = float(1.0 - np.dot(ci, cj))
+                if dist < self.amplification_threshold:
+                    used[j] = True
+                    group_mass += body_j.mass * factor_j
                     # mass-weighted centroid update
-                    total = g_mass + mass
-                    group[0] = (g_centroid * g_mass + centroid * mass) / total
-                    group[1] = total
-                    placed = True
-                    break
+                    total = group_mass
+                    group_centroid = (
+                        group_centroid * (total - body_j.mass * factor_j)
+                        + body_j.centroid * body_j.mass * factor_j
+                    ) / (total + 1e-8)
 
-            if not placed:
-                groups.append([centroid.copy(), mass])
+            groups.append((group_centroid, group_mass))
 
-        return [(np.array(g[0]), g[1]) for g in groups]
+        return groups
 
     def _compute_resonance_forces(
         self,
@@ -263,363 +230,122 @@ class GravitationalSampler:
         token_mass: float,
     ) -> np.ndarray:
         """
-        Compute Lagrange midpoint forces for co-active resonant body pairs.
+        Compute additional force from resonance pairs.
 
-        When two ContextBodyRecord bodies in active_bodies have a mutual resonance
-        score above resonance_threshold, they define a Lagrange midpoint:
-
-            midpoint = (centroid_A + centroid_B) / 2
-
-        The force toward this midpoint uses the geometric mean of the two body
-        masses as the effective joint mass:
-
-            F = G * m_token * sqrt(m_A * m_B) * score / r²  ·  r̂_midpoint
-
-        This steers sampling toward tokens that bridge both resonant topics —
-        the semantic region between them — with strength proportional to how
-        consistently they've co-occurred across sessions.
-
-        Only ContextBodyRecord pairs are checked; ephemeral ContextBody objects
-        have no cross-session resonance history.
+        For each pair of ContextBodyRecord objects in active_bodies with
+        resonance score >= resonance_threshold, compute a force toward the
+        Lagrange midpoint of the pair scaled by joint_mass = sqrt(m_A * m_B) * score.
         """
         force = np.zeros_like(token_embedding)
-        checked_pairs: set[frozenset] = set()
+        records = [
+            body for _, body, _ in self.active_bodies
+            if isinstance(body, ContextBodyRecord)
+        ]
+        if len(records) < 2:
+            return force
 
-        for i, (_, body_a, _) in enumerate(self.active_bodies):
-            if not isinstance(body_a, ContextBodyRecord):
-                continue
-            if not body_a.resonance_partners:
-                continue
-
-            for j, (_, body_b, _) in enumerate(self.active_bodies):
-                if i >= j:
-                    continue
-                pair = frozenset({str(body_a.id), str(getattr(body_b, "id", None))})
-                if pair in checked_pairs:
-                    continue
-                checked_pairs.add(pair)
-
-                partner_id = str(getattr(body_b, "id", None))
-                if not partner_id or partner_id not in body_a.resonance_partners:
-                    continue
-
-                score = body_a.resonance_partners[partner_id]
+        for i in range(len(records)):
+            for j in range(i + 1, len(records)):
+                ra, rb = records[i], records[j]
+                score = ra.resonance_partners.get(str(rb.id), 0.0)
                 if score < self.resonance_threshold:
                     continue
-
-                # Lagrange midpoint between the two resonant body centroids
-                midpoint = (body_a.centroid + body_b.centroid) / 2.0
-                mid_norm = np.linalg.norm(midpoint)
-                if mid_norm < 1e-8:
-                    continue
-
-                # cosine distance from token to midpoint
-                r = float(1.0 - np.dot(token_embedding, midpoint) / (
-                    np.linalg.norm(token_embedding) * mid_norm + 1e-8
-                ))
-                r = max(r, 1e-8)
-
-                # joint mass = geometric mean; preserves units and scales naturally
-                joint_mass = float(np.sqrt(body_a.mass * body_b.mass))
-
-                # resonance force requires both bodies to be temporally fresh;
-                # use the product of factors so either body going cold kills the term
-                recency = self._recency_factor(body_a) * self._recency_factor(body_b)
-
-                f_magnitude = self.G * token_mass * joint_mass * score * recency / (r ** 2)
-
-                direction = midpoint - token_embedding
-                d_norm = np.linalg.norm(direction)
-                if d_norm > 1e-8:
-                    force += f_magnitude * (direction / d_norm)
+                midpoint = (ra.centroid + rb.centroid) / 2.0
+                joint_mass = float(np.sqrt(ra.mass * rb.mass)) * score
+                force += self._gravitational_force(
+                    token_embedding, token_mass, midpoint, joint_mass
+                )
 
         return force
 
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
+    def _check_collisions(self) -> None:
+        """
+        Inelastic collision: merge any two ContextBody objects in active_bodies
+        whose centroids are within collision_distance.
+
+        Only ContextBody (label >= 0) objects participate.
+        Merged body has summed mass and mass-weighted centroid.
+        """
+        changed = True
+        while changed:
+            changed = False
+            body_entries = [
+                (i, label, body)
+                for i, (label, body, dist) in enumerate(self.active_bodies)
+                if isinstance(body, ContextBody) and label >= 0
+            ]
+            for ai in range(len(body_entries)):
+                for bi in range(ai + 1, len(body_entries)):
+                    idx_a, label_a, body_a = body_entries[ai]
+                    idx_b, label_b, body_b = body_entries[bi]
+                    ca = body_a.centroid / (np.linalg.norm(body_a.centroid) + 1e-8)
+                    cb = body_b.centroid / (np.linalg.norm(body_b.centroid) + 1e-8)
+                    dist = float(1.0 - np.dot(ca, cb))
+                    if dist < self.collision_distance:
+                        # Merge b into a
+                        total_mass = body_a.mass + body_b.mass
+                        merged_centroid = (
+                            body_a.centroid * body_a.mass
+                            + body_b.centroid * body_b.mass
+                        ) / (total_mass + 1e-8)
+                        merged = ContextBody()
+                        merged.centroid = merged_centroid
+                        merged.mass = total_mass
+                        merged.member_tokens = body_a.member_tokens | body_b.member_tokens
+                        merged.stability = (body_a.stability + body_b.stability) / 2.0
+
+                        # Remove both, add merged
+                        remove_indices = sorted([idx_a, idx_b], reverse=True)
+                        for ri in remove_indices:
+                            self.active_bodies.pop(ri)
+                        avg_dist = (
+                            self.active_bodies[0][2] if self.active_bodies else 0.0
+                        )
+                        self.active_bodies.append((label_a, merged, avg_dist))
+                        changed = True
+                        break
+                if changed:
+                    break
 
     def sample(
         self,
-        logits: torch.Tensor,           # [vocab_size]
+        logits: torch.Tensor,         # [vocab_size]
         token_embeddings: torch.Tensor,  # [vocab_size, D]
-        weight_matrix: torch.Tensor,     # [vocab_size, D]
+        token_mass: float = 1.0,
     ) -> int:
         """
-        Apply gravitational field to logits and sample next token.
+        Sample one token index from gravity-biased logits.
 
-        Gravity bias is added to logits (not multiplied to probabilities) to
-        preserve the relative shape of the base distribution while steering it.
-        This avoids distribution collapse that could occur with multiplicative bias.
-
-        Returns the sampled token id.
+        Returns integer token index in [0, vocab_size).
         """
         vocab_size = logits.shape[0]
-        gravity_bias = np.zeros(vocab_size, dtype=np.float32)
+        embs_np = token_embeddings.cpu().numpy()  # [vocab_size, D]
 
-        # group nearby bodies into virtual bodies once per step — O(n²) in
-        # active body count but n is small; avoids recomputing for every token
-        virtual_bodies = self._group_active_bodies()
+        # Get virtual body groups
+        groups = self._group_active_bodies()
 
-        escaped = 0
-        for token_id in range(vocab_size):
-            token_emb = token_embeddings[token_id].cpu().numpy()
-            token_mass = self._compute_token_mass(token_id, weight_matrix)
-
-            total_force = np.zeros_like(token_emb)
-            for v_centroid, v_mass in virtual_bodies:
+        # Compute force magnitudes for each candidate token
+        force_magnitudes = np.zeros(vocab_size)
+        for i in range(vocab_size):
+            tok_emb = embs_np[i]
+            total_force = np.zeros_like(tok_emb)
+            for body_centroid, body_mass in groups:
                 total_force += self._gravitational_force(
-                    token_emb, token_mass, v_centroid, v_mass
+                    tok_emb, token_mass, body_centroid, body_mass
                 )
-            total_force += self._compute_resonance_forces(token_emb, token_mass)
+            # Add resonance forces
+            total_force += self._compute_resonance_forces(tok_emb, token_mass)
+            force_magnitudes[i] = float(np.linalg.norm(total_force))
 
-            force_magnitude = float(np.linalg.norm(total_force))
+        # Escape rate tracking
+        escape_count = int(np.sum(force_magnitudes < self.escape_threshold))
+        self._last_escape_count = escape_count
+        self._last_vocab_size = vocab_size
 
-            # only apply bias if token exceeds escape threshold
-            if force_magnitude > self.escape_threshold:
-                gravity_bias[token_id] = force_magnitude
-            else:
-                escaped += 1
+        # Bias logits
+        bias = torch.tensor(force_magnitudes, dtype=logits.dtype, device=logits.device)
+        adjusted_logits = logits + bias
 
-        # add gravity bias to logits and sample
-        bias_tensor = torch.tensor(gravity_bias, dtype=torch.float32).to(self.device)
-        adjusted_logits = logits + bias_tensor
-        adjusted_probs = F.softmax(adjusted_logits, dim=-1)
-        next_token = int(torch.multinomial(adjusted_probs, num_samples=1).item())
-
-        # update orbital state with sampled token's embedding
-        next_emb = token_embeddings[next_token].cpu().numpy()
-        self.orbital_state.update(next_emb)
-
-        # update domain inference from the new token embedding
-        if self.domain_classifier is not None:
-            self.domain = self.domain_classifier.update(next_emb)
-
-        # update adaptive G from this step's escape rate and body masses.
-        # G is updated *after* sampling so it influences the *next* step —
-        # a look-ahead correction rather than a same-step feedback loop.
-        if self.adaptive_g is not None:
-            escape_rate = escaped / vocab_size if vocab_size > 0 else 1.0
-            self.G = self.adaptive_g.update(
-                active_bodies=self.active_bodies,
-                escape_rate=escape_rate,
-                domain=self.domain,
-            )
-
-        # compute token mass from weight norms, then update clustering
-        next_token_mass = self._compute_token_mass(next_token, weight_matrix)
-        self._update_clustering(next_token, next_emb, next_token_mass)
-
-        return next_token
-
-    # ------------------------------------------------------------------
-    # Collision detection
-    # ------------------------------------------------------------------
-
-    def _check_collisions(self) -> None:
-        """
-        Detect and resolve inelastic collisions between active in-session bodies.
-
-        Scans all pairs of ephemeral ContextBody objects in active_bodies. When
-        two bodies are within collision_distance (cosine), the lighter is absorbed
-        by the heavier using conservation of momentum:
-
-            centroid_merged  = (m_A * c_A + m_B * c_B) / (m_A + m_B)
-            velocity_merged  = (m_A * v_A + m_B * v_B) / (m_A + m_B)
-            mass_merged      = m_A + m_B
-
-        This handles the case where two cluster centroids converge semantically
-        without a bridging token — a gap DBSCAN merge cannot close on its own.
-        The merged body replaces both originals in active_bodies with label=-1
-        (treated as a non-DBSCAN body for label-tracking purposes).
-
-        If the merged body is stable enough, it is persisted to the store.
-        DBSCAN's internal cluster state is left intact — the original clusters
-        continue to receive new tokens, but force computation uses the merged body.
-        """
-        # collect only in-session ContextBody entries (label >= 0)
-        body_entries: list[tuple[int, int, ContextBody]] = [
-            (active_idx, label, body)
-            for active_idx, (label, body, _) in enumerate(self.active_bodies)
-            if isinstance(body, ContextBody) and label >= 0
-        ]
-
-        absorbed: set[int] = set()   # active_bodies indices to remove
-        merged_bodies: list[tuple[int, ContextBody, float]] = []
-
-        for i in range(len(body_entries)):
-            for j in range(i + 1, len(body_entries)):
-                active_idx_a, _, body_a = body_entries[i]
-                active_idx_b, _, body_b = body_entries[j]
-
-                if active_idx_a in absorbed or active_idx_b in absorbed:
-                    continue
-
-                r = float(1.0 - np.dot(body_a.centroid, body_b.centroid) / (
-                    np.linalg.norm(body_a.centroid) * np.linalg.norm(body_b.centroid) + 1e-8
-                ))
-
-                if r >= self.collision_distance:
-                    continue
-
-                # inelastic collision — lighter absorbed by heavier
-                heavy, light = (
-                    (body_a, body_b) if body_a.mass >= body_b.mass
-                    else (body_b, body_a)
-                )
-                heavy_active_idx = (
-                    active_idx_a if body_a.mass >= body_b.mass else active_idx_b
-                )
-                light_active_idx = (
-                    active_idx_b if body_a.mass >= body_b.mass else active_idx_a
-                )
-
-                total_mass = heavy.mass + light.mass
-
-                merged = ContextBody(
-                    domain=heavy.domain,
-                    centroid=(
-                        heavy.centroid * heavy.mass + light.centroid * light.mass
-                    ) / total_mass,
-                    centroid_velocity=(
-                        heavy.centroid_velocity * heavy.mass
-                        + light.centroid_velocity * light.mass
-                    ) / total_mass,
-                    mass=total_mass,
-                    density=heavy.density + light.density,
-                    # stability is the minimum of the two — a fresh collision
-                    # is less stable than either parent alone
-                    stability=min(heavy.stability, light.stability),
-                    member_tokens=heavy.member_tokens | light.member_tokens,
-                    parent_ids=[heavy.id, light.id],
-                )
-
-                if merged.stability >= self.stability_threshold:
-                    merged_id = self.body_store.record(
-                        centroid=merged.centroid,
-                        mass=merged.mass,
-                        stability=merged.stability,
-                        domain=merged.domain,
-                    )
-                    # the merged body inherits no DBSCAN label (label=-1),
-                    # but record its parents' labels so future collision events
-                    # between siblings of the absorbed bodies route correctly
-                    self._label_record_ids[heavy_active_idx] = str(merged_id)
-                    for _, other_body, _ in self.active_bodies:
-                        if isinstance(other_body, ContextBodyRecord):
-                            self.body_store.record_resonance(
-                                str(merged_id), str(other_body.id)
-                            )
-
-                absorbed.add(heavy_active_idx)
-                absorbed.add(light_active_idx)
-                # label=-1: merged body is not tracked by DBSCAN label logic
-                merged_bodies.append((-1, merged, 0.0))
-
-        if absorbed:
-            self.active_bodies = [
-                entry for active_idx, entry in enumerate(self.active_bodies)
-                if active_idx not in absorbed
-            ]
-            self.active_bodies.extend(merged_bodies)
-
-    # ------------------------------------------------------------------
-    # Clustering maintenance
-    # ------------------------------------------------------------------
-
-    def _update_clustering(
-        self, token_id: int, embedding: np.ndarray, token_mass: float = 1.0
-    ) -> None:
-        """
-        Incrementally update DBSCAN clustering with the newly sampled token.
-        Keeps active_bodies in sync by tracking cluster labels alongside bodies.
-
-        token_mass — derived from ||W[token_id]|| / G; propagated into the
-                     cluster so body mass accumulates correctly from weight norms.
-
-        Three events to handle:
-            new_bodies        — append with their cluster label
-            merged_events     — remove absorbed labels; surviving label stays
-            fragmented_events — remove old label; append new fragment labels
-        """
-        new_bodies, merged_events, fragmented_events, collision_events = self.clustering.update(
-            token_id, embedding, token_mass=token_mass
-        )
-
-        # new cluster formed — append
-        for body in new_bodies:
-            body.domain = self.domain
-            label = next(
-                (lbl for lbl in self.clustering.clusters
-                 if body.member_tokens <= self.clustering.clusters[lbl]),
-                -1,
-            )
-            if body.stability >= self.stability_threshold:
-                new_id = self.body_store.record(
-                    centroid=body.centroid,
-                    mass=body.mass,
-                    stability=body.stability,
-                    domain=body.domain,
-                )
-                self._label_record_ids[label] = str(new_id)
-                # record resonance with all already-persisted co-active bodies
-                for _, other_body, _ in self.active_bodies:
-                    if isinstance(other_body, ContextBodyRecord):
-                        self.body_store.record_resonance(
-                            str(new_id), str(other_body.id)
-                        )
-            self.active_bodies.append((label, body, 0.0))
-
-        # merge — remove absorbed labels (surviving label's body centroid
-        # was updated in-place so it remains correct in active_bodies)
-        if merged_events:
-            absorbed = {old for old, _ in merged_events}
-            self.active_bodies = [
-                (lbl, b, d) for lbl, b, d in self.active_bodies
-                if lbl not in absorbed
-            ]
-
-        # fragmentation — remove old label, add fragment bodies
-        for old_label, frag_bodies in fragmented_events:
-            self.active_bodies = [
-                (lbl, b, d) for lbl, b, d in self.active_bodies
-                if lbl != old_label
-            ]
-            for frag_body in frag_bodies:
-                frag_body.domain = self.domain
-                frag_label = next(
-                    (lbl for lbl in self.clustering.clusters
-                     if frag_body.member_tokens <= self.clustering.clusters[lbl]),
-                    -1,
-                )
-                if frag_body.stability >= self.stability_threshold:
-                    frag_id = self.body_store.record(
-                        centroid=frag_body.centroid,
-                        mass=frag_body.mass,
-                        stability=frag_body.stability,
-                        domain=frag_body.domain,
-                    )
-                    self._label_record_ids[frag_label] = str(frag_id)
-                    # record resonance with all already-persisted co-active bodies
-                    for _, other_body, _ in self.active_bodies:
-                        if isinstance(other_body, ContextBodyRecord):
-                            self.body_store.record_resonance(
-                                str(frag_id), str(other_body.id)
-                            )
-                self.active_bodies.append((frag_label, frag_body, 0.0))
-
-        # near-approach collision events from DBSCAN: two cluster centroids within
-        # collision_detection_threshold but not yet DBSCAN-merged.
-        # If both bodies have been persisted to the store, boost their resonance
-        # score — they're converging semantically and co-occurrence should strengthen
-        # even before they fully merge. This primes the Lagrange midpoint force for
-        # the region between them on future tokens.
-        for label_a, label_b, _dist in collision_events:
-            rec_id_a = self._label_record_ids.get(label_a)
-            rec_id_b = self._label_record_ids.get(label_b)
-            if rec_id_a is not None and rec_id_b is not None:
-                self.body_store.record_resonance(rec_id_a, rec_id_b, increment=0.2)
-
-        # check for inelastic collisions among in-session bodies after all
-        # DBSCAN events have been applied this step
-        self._check_collisions()
+        probs = torch.softmax(adjusted_logits, dim=-1)
+        token_idx = int(torch.multinomial(probs, num_samples=1).item())
+        return token_idx

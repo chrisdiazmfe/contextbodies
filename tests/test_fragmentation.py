@@ -51,11 +51,13 @@ def seed_cluster(db: IncrementalDBSCAN, embs: np.ndarray, label: int = 0) -> Non
     db.labels = [label] * len(embs)
     db.point_types = ["core"] * len(embs)
     db.clusters = {label: set(range(len(embs)))}
+    # Advance _next_label past the planted label so fragments get fresh labels
+    db._next_label = max(db._next_label, label + 1)
     db._update_centroid(label)
 
-    for emb in embs:
+    for i, emb in enumerate(embs):
         norm_emb = db._normalize(emb).reshape(1, -1).astype(np.float32)
-        db.index.add(norm_emb)
+        db.index.add_with_ids(norm_emb, np.array([i], dtype=np.int64))
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +374,8 @@ class TestConnectedComponents:
         # mark all as border — no core points
         db.point_types = ["border"] * 5
         db._update_centroid(label)
-        for emb in embs:
-            db.index.add(db._normalize(emb).reshape(1, -1).astype(np.float32))
+        for i, emb in enumerate(embs):
+            db.index.add_with_ids(db._normalize(emb).reshape(1, -1).astype(np.float32), np.array([i], dtype=np.int64))
 
         components = db._connected_components(0)
         assert len(components) == 1
@@ -538,7 +540,7 @@ class TestUpdateIntegration:
 
         got_body = False
         for i, emb in enumerate(embs):
-            new_bodies, _, _ = db.update(token_id=i, embedding=emb)
+            new_bodies, _, _, _ = db.update(token_id=i, embedding=emb)
             if new_bodies:
                 got_body = True
                 break
@@ -548,20 +550,26 @@ class TestUpdateIntegration:
     def test_merge_events_emitted(self):
         """
         Two separate clusters bridged by a new token should emit a merge event.
-        """
-        group_a = make_tight_cluster(
-            normalized(np.array([1.0, 0.1] + [0.0] * (DIM - 2))), 5, noise=0.005, seed=1
-        )
-        group_b = make_tight_cluster(
-            normalized(np.array([0.1, 1.0] + [0.0] * (DIM - 2))), 5, noise=0.005, seed=2
-        )
-        bridge = normalized(np.array([0.7, 0.7] + [0.0] * (DIM - 2))).reshape(1, -1)
 
-        db = IncrementalDBSCAN(dim=DIM, eps=0.15, min_samples=3)
+        Setup: two tight groups separated by ~0.06 cosine dist, with a bridge
+        point equidistant from both at ~0.015. eps=0.02 lets the bridge reach
+        both groups but keeps the groups out of direct eps-range of each other.
+        """
+        import math
+        angle = math.radians(20)
+        center_a = normalized(np.array([1.0, 0.0] + [0.0] * (DIM - 2)))
+        center_b = normalized(np.array([math.cos(angle), math.sin(angle)] + [0.0] * (DIM - 2)))
+        center_bridge = normalized(np.array([math.cos(angle / 2), math.sin(angle / 2)] + [0.0] * (DIM - 2)))
+
+        group_a = make_tight_cluster(center_a, 5, noise=0.002, seed=1)
+        group_b = make_tight_cluster(center_b, 5, noise=0.002, seed=2)
+        bridge = center_bridge.reshape(1, -1)
+
+        db = IncrementalDBSCAN(dim=DIM, eps=0.02, min_samples=3)
 
         merged_any = False
         for i, emb in enumerate(np.vstack([group_a, group_b, bridge])):
-            _, merge_events, _ = db.update(token_id=i, embedding=emb)
+            _, merge_events, _, _ = db.update(token_id=i, embedding=emb)
             if merge_events:
                 merged_any = True
                 break
@@ -593,7 +601,7 @@ class TestUpdateIntegration:
 
         fragmented = False
         for i, emb in enumerate(all_embs):
-            _, _, frag_events = db.update(token_id=i, embedding=emb)
+            _, _, frag_events, _ = db.update(token_id=i, embedding=emb)
             if frag_events:
                 fragmented = True
                 # verify the event shape: (old_label, [body, body])

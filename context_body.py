@@ -20,11 +20,11 @@ class ContextBody:
     lightweight persistent form stored in the vector database.
 
     Mass hierarchy (for classify()):
-        Black hole   — dominant, inescapable theme (e.g. system prompt constraint)
-        Neutron star — rare but highly specific, dense context
-        Planet       — moderate, stable topic
-        Moon         — sub-topic orbiting a planet
-        Asteroid     — passing mention, weak influence
+        Black hole   -- dominant, inescapable theme (e.g. system prompt constraint)
+        Neutron star -- rare but highly specific, dense context
+        Planet       -- moderate, stable topic
+        Moon         -- sub-topic orbiting a planet
+        Asteroid     -- passing mention, weak influence
     """
 
     # Identity
@@ -37,18 +37,17 @@ class ContextBody:
     covariance: np.ndarray = field(default_factory=lambda: np.array([]))
 
     # Mass properties
-    mass: float = 0.0       # derived from cluster density
-    density: float = 0.0    # tokens per unit volume in embedding space
-    stability: float = 0.0  # 0-1, how consistent the centroid has been
+    mass: float = 0.0
+    density: float = 0.0
+    stability: float = 0.0
 
-    # Ephemeral membership — used for clustering operations, never persisted
+    # Ephemeral membership
     member_tokens: set[int] = field(default_factory=set)
     orbital_radii: dict[int, float] = field(default_factory=dict)
     orbital_velocities: dict[int, np.ndarray] = field(default_factory=dict)
 
-    # Lineage — ephemeral, tracks splits within a conversation session
-    # Relationships across sessions are recovered at query time via similarity
-    parent_ids: list[UUID] = field(default_factory=list)
+    # Lineage
+    parent_ids: list = field(default_factory=list)
 
     def accrete(
         self,
@@ -56,33 +55,30 @@ class ContextBody:
         token_embedding: np.ndarray,
         token_mass: float = 1.0,
     ) -> None:
-        """
-        Add a new token to this body, updating centroid and mass.
-        Analogous to a body gaining mass from nearby matter.
-
-        token_mass — physical mass of the incoming token, derived from model
-                     weight norms via ||W[token_id]|| / G. Defaults to 1.0
-                     when the weight matrix is unavailable.
-        """
+        """Add a new token to this body, updating centroid and mass."""
         n = len(self.member_tokens)
         self.member_tokens.add(token_id)
 
-        prev_centroid = self.centroid.copy()
-        self.centroid = (self.centroid * n + token_embedding) / (n + 1)
-        self.centroid_velocity = self.centroid - prev_centroid
+        if n == 0:
+            self.centroid = token_embedding.copy().astype(float)
+            self.centroid_velocity = np.zeros_like(self.centroid)
+        else:
+            prev_centroid = self.centroid.copy()
+            self.centroid = (self.centroid * n + token_embedding) / (n + 1)
+            self.centroid_velocity = self.centroid - prev_centroid
 
         self.mass += token_mass
 
-        r = float(1 - np.dot(token_embedding, self.centroid) / (
-            np.linalg.norm(token_embedding) * np.linalg.norm(self.centroid) + 1e-8
-        ))
+        c_norm = np.linalg.norm(self.centroid)
+        t_norm = np.linalg.norm(token_embedding)
+        if c_norm > 1e-8 and t_norm > 1e-8:
+            r = float(1.0 - np.dot(token_embedding, self.centroid) / (t_norm * c_norm))
+        else:
+            r = 0.0
         self.orbital_radii[token_id] = r
 
     def classify(self) -> str:
-        """
-        Classify this body by mass tier.
-        Thresholds are illustrative — tune per domain and embedding scale.
-        """
+        """Classify this body by mass tier."""
         if self.mass > 1000:
             return "black_hole"
         elif self.mass > 500:
