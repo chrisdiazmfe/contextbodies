@@ -135,6 +135,27 @@ class GravitationalSampler:
         weight_norm = torch.norm(weight_matrix[token_id]).item()
         return weight_norm / self.G
 
+    def _gravitational_field_strength(
+        self,
+        token_embedding: np.ndarray,
+        token_mass: float,
+        body_centroid: np.ndarray,
+        body_mass: float,
+    ) -> float:
+        """
+        Scalar gravitational field strength at a token's location.
+
+            Φ = G * (m_token * m_body) / r^2
+
+        Used for logit biasing in sample(). Correctly returns a large value
+        when the token is very close to or coincident with the body centroid.
+        """
+        c_tok = token_embedding / (np.linalg.norm(token_embedding) + 1e-8)
+        c_body = body_centroid / (np.linalg.norm(body_centroid) + 1e-8)
+        r = float(1.0 - np.dot(c_tok, c_body))
+        r = max(r, 1e-6)
+        return self.G * token_mass * body_mass / (r ** 2)
+
     def _gravitational_force(
         self,
         token_embedding: np.ndarray,
@@ -143,11 +164,13 @@ class GravitationalSampler:
         body_mass: float,
     ) -> np.ndarray:
         """
-        Compute gravitational force vector on a token from a body.
+        Gravitational force vector on a token from a body.
 
             F = G * (m_token * m_body) / r^2  *  r_hat
 
-        Distance r is cosine distance. Force vector points toward body centroid.
+        Used for orbital state updates and resonance forces. Returns zero
+        vector when token is coincident with the body (direction undefined).
+        For logit biasing use _gravitational_field_strength() instead.
         """
         direction = body_centroid - token_embedding
         r = float(1.0 - np.dot(
@@ -324,18 +347,22 @@ class GravitationalSampler:
         # Get virtual body groups
         groups = self._group_active_bodies()
 
-        # Compute force magnitudes for each candidate token
+        # Compute gravitational field strength for each candidate token.
+        # Uses scalar field strength (G*m*M/r²) rather than force vector norm
+        # so tokens coincident with a body centroid correctly receive maximum
+        # bias rather than zero (force vector direction is undefined at r=0).
         force_magnitudes = np.zeros(vocab_size)
         for i in range(vocab_size):
             tok_emb = embs_np[i]
-            total_force = np.zeros_like(tok_emb)
+            # Scalar field strength from all virtual body groups
+            field = 0.0
             for body_centroid, body_mass in groups:
-                total_force += self._gravitational_force(
+                field += self._gravitational_field_strength(
                     tok_emb, token_mass, body_centroid, body_mass
                 )
-            # Add resonance forces
-            total_force += self._compute_resonance_forces(tok_emb, token_mass)
-            force_magnitudes[i] = float(np.linalg.norm(total_force))
+            # Vector resonance forces (midpoint attraction; direction meaningful)
+            resonance_force = self._compute_resonance_forces(tok_emb, token_mass)
+            force_magnitudes[i] = field + float(np.linalg.norm(resonance_force))
 
         # Escape rate tracking
         escape_count = int(np.sum(force_magnitudes < self.escape_threshold))
