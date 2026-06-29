@@ -376,3 +376,89 @@ class GravitationalSampler:
         probs = torch.softmax(adjusted_logits, dim=-1)
         token_idx = int(torch.multinomial(probs, num_samples=1).item())
         return token_idx
+
+    def post_step(
+        self,
+        token_id: int,
+        token_embedding: np.ndarray,
+        token_mass: float = 1.0,
+    ) -> None:
+        """
+        Update clustering with the token that was just sampled.
+
+        Must be called after every sample() call with the embedding of the
+        returned token. This is what drives body formation — without it,
+        active_bodies remains empty and the gravitational field is never built.
+
+        Responsibilities:
+            1. Feed the token into IncrementalDBSCAN.
+            2. Rebuild active_bodies from current cluster state.
+            3. Persist newly stable bodies to the store.
+            4. Boost resonance for collision-event pairs.
+            5. Run inelastic collision check on active_bodies.
+        """
+        if self.clustering is None:
+            return
+
+        _, merged_events, _, collision_events = self.clustering.update(
+            token_id=token_id,
+            embedding=token_embedding,
+            token_mass=token_mass,
+        )
+
+        # Remove merged-away labels from the record mapping
+        for old_label, _ in merged_events:
+            self._label_record_ids.pop(old_label, None)
+
+        # Update domain classifier
+        if self.domain_classifier is not None:
+            self.domain = self.domain_classifier.update(token_embedding)
+
+        # Rebuild cluster portion of active_bodies from current DBSCAN state.
+        # Keep store records (label=-1) in place; replace all label>=0 entries.
+        store_entries = [
+            entry for entry in self.active_bodies
+            if not isinstance(entry[1], ContextBody)
+        ]
+        cluster_entries: list[tuple[int, ContextBody, float]] = []
+        for label in self.clustering.clusters:
+            body = self.clustering._make_body(label)
+            cluster_entries.append((label, body, 0.0))
+
+            # Persist body if stable and not yet persisted
+            if (
+                body.stability >= self.stability_threshold
+                and label not in self._label_record_ids
+                and body.mass > 0
+            ):
+                record_id = self.body_store.record(
+                    centroid=body.centroid,
+                    mass=body.mass,
+                    stability=body.stability,
+                    domain=self.domain,
+                )
+                self._label_record_ids[label] = str(record_id)
+
+        self.active_bodies = store_entries + cluster_entries
+
+        # Collision events → resonance boost for persisted pairs
+        for label_a, label_b, _dist in collision_events:
+            id_a = self._label_record_ids.get(label_a)
+            id_b = self._label_record_ids.get(label_b)
+            if id_a and id_b:
+                self.body_store.record_resonance(id_a, id_b, delta=0.2)
+
+        # Inelastic collision check within active bodies
+        self._check_collisions()
+
+        # Update adaptive G if configured
+        if self.adaptive_g is not None:
+            escape_rate = (
+                self._last_escape_count / (self._last_vocab_size + 1e-8)
+                if self._last_vocab_size > 0 else 0.0
+            )
+            self.G = self.adaptive_g.update(
+                active_bodies=[body for _, body, _ in self.active_bodies],
+                escape_rate=escape_rate,
+                domain=self.domain,
+            )

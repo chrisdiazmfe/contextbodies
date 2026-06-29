@@ -173,11 +173,23 @@ def generate_gravitational(
     generated = input_ids[0].tolist()
     step_metrics: list[StepMetrics] = []
     total_start = time.perf_counter()
+    past_key_values = None
 
     for step in range(max_tokens):
         with torch.no_grad():
             t0 = time.perf_counter()
-            outputs = model(torch.tensor([generated], device=device))
+            if past_key_values is None:
+                outputs = model(
+                    torch.tensor([generated], device=device),
+                    use_cache=True,
+                )
+            else:
+                outputs = model(
+                    torch.tensor([[generated[-1]]], device=device),
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+            past_key_values = outputs.past_key_values
             logits = outputs.logits[0, -1, :]
 
             next_token = sampler.sample(
@@ -185,6 +197,10 @@ def generate_gravitational(
                 token_embeddings=token_embeddings,
             )
             latency_ms = (time.perf_counter() - t0) * 1000
+
+        # Update clustering with the selected token
+        tok_emb = token_embeddings[next_token].cpu().numpy()
+        sampler.post_step(token_id=next_token, token_embedding=tok_emb)
 
         escape_rate = (
             sampler._last_escape_count / (sampler._last_vocab_size + 1e-8)

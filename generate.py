@@ -47,16 +47,32 @@ def generate(
     sampler.initialize(context_embeddings, embedding_dim)
 
     generated = input_ids[0].tolist()
+    past_key_values = None
 
     for _ in range(max_tokens):
         with torch.no_grad():
-            outputs = model(torch.tensor([generated], device=device))
-            logits = outputs.logits[0, -1, :]   # [vocab_size] — last position only
+            if past_key_values is None:
+                outputs = model(
+                    torch.tensor([generated], device=device),
+                    use_cache=True,
+                )
+            else:
+                outputs = model(
+                    torch.tensor([[generated[-1]]], device=device),
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+            past_key_values = outputs.past_key_values
+            logits = outputs.logits[0, -1, :]   # [vocab_size]
 
         next_token = sampler.sample(
             logits=logits,
             token_embeddings=token_embeddings,
         )
+
+        # Feed selected token into clustering so bodies can form
+        tok_emb = token_embeddings[next_token].cpu().numpy()
+        sampler.post_step(token_id=next_token, token_embedding=tok_emb)
 
         generated.append(next_token)
 
