@@ -295,6 +295,8 @@ def parse_args() -> argparse.Namespace:
                    help="Enable AdaptiveG controller")
     p.add_argument("--recency-lambda", type=float, default=0.0,
                    help="Recency decay lambda (default: 0.0 = disabled)")
+    p.add_argument("--no-idf", action="store_true",
+                   help="Disable IDF mass normalization (use raw token_mass for all tokens)")
     p.add_argument("--dbscan-eps", type=float, default=0.3,
                    help="DBSCAN epsilon: cosine distance radius for cluster membership (default: 0.3)")
     p.add_argument("--dbscan-min-samples", type=int, default=3,
@@ -389,6 +391,20 @@ def main() -> None:
 
     adaptive_g = AdaptiveG(G_base=args.G) if args.adaptive_g else None
 
+    # Precompute IDF weights once from the model's unconditional distribution.
+    # Shared across all sampler instances — only depends on the model, not the prompt.
+    idf_weights = None
+    if not args.no_idf:
+        print("Precomputing IDF weights...")
+        _tmp = GravitationalSampler(
+            body_store=ContextBodyStore(embedding_dim=embedding_dim, decay_interval=9999),
+            G=1.0,
+        )
+        _tmp.precompute_idf_weights(model)
+        idf_weights = _tmp._idf_weights
+        print(f"  IDF weights computed. Min={idf_weights.min():.3f} Max={idf_weights.max():.3f} "
+              f"Mean={idf_weights.mean():.3f}")
+
     for i, prompt in enumerate(prompts):
         for run in range(args.runs):
             print(f"  prompt {i+1}/{len(prompts)}, run {run+1}/{args.runs}", end="\r")
@@ -404,6 +420,7 @@ def main() -> None:
                 dbscan_eps=args.dbscan_eps,
                 dbscan_min_samples=args.dbscan_min_samples,
             )
+            sampler._idf_weights = idf_weights  # None if --no-idf
 
             text, elapsed, step_mets = generate_gravitational(
                 model, tokenizer, prompt,

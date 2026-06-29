@@ -40,6 +40,10 @@ def generate(
     token_embeddings = model.get_input_embeddings().weight   # [vocab, D]
     embedding_dim = token_embeddings.shape[1]
 
+    # Compute IDF weights from unconditional distribution (one-time cost)
+    if sampler._idf_weights is None:
+        sampler.precompute_idf_weights(model)
+
     # initialize sampler with prompt context
     with torch.no_grad():
         context_embeddings = token_embeddings[input_ids[0]]  # [prompt_len, D]

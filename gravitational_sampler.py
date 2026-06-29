@@ -96,9 +96,44 @@ class GravitationalSampler:
         self._cached_token_embs_norm: np.ndarray | None = None  # row-normalized [vocab, D]
         self._cached_token_embs_id: int = -1
 
+        # IDF-style mass weights [vocab_size], computed from unconditional token
+        # probabilities via precompute_idf_weights(). Common tokens (punctuation,
+        # articles) get low weight; rare specific tokens get weight near 1.0.
+        # None until precompute_idf_weights() is called.
+        self._idf_weights: np.ndarray | None = None
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
+
+    def precompute_idf_weights(self, model: torch.nn.Module) -> None:
+        """
+        Compute IDF-style mass weights from the model's unconditional distribution.
+
+        Runs one forward pass with the BOS token to get p(token | <BOS>) across
+        the full vocabulary. Common tokens (punctuation, articles, EOS) receive
+        low weight because the model assigns them high unconditional probability.
+        Rare, semantically specific tokens receive weight near 1.0.
+
+        Weights are stored in self._idf_weights[token_id] ∈ [0, 1] and applied
+        in post_step() when accreting tokens onto DBSCAN clusters.
+
+        Call this once before initialize(), or after if the model is loaded later.
+        """
+        model.eval()
+        device = next(model.parameters()).device
+        bos_id = getattr(model.config, "bos_token_id", None) or 0
+        input_ids = torch.tensor([[bos_id]], device=device)
+
+        with torch.no_grad():
+            outputs = model(input_ids)
+            logits = outputs.logits[0, -1, :]          # [vocab_size]
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+
+        # IDF: common tokens have high p → low weight; rare tokens have low p → high weight
+        idf = -np.log(probs + 1e-8)
+        idf_min, idf_max = idf.min(), idf.max()
+        self._idf_weights = (idf - idf_min) / (idf_max - idf_min + 1e-8)
 
     def initialize(
         self,
@@ -434,10 +469,21 @@ class GravitationalSampler:
         if self.clustering is None:
             return
 
+        # Scale token mass by IDF weight so common tokens (punctuation, articles,
+        # EOS) accrete less mass onto bodies than rare, semantically specific tokens.
+        # Prompt tokens (negative ids) skip IDF weighting.
+        effective_mass = token_mass
+        if (
+            self._idf_weights is not None
+            and token_id >= 0
+            and token_id < len(self._idf_weights)
+        ):
+            effective_mass = token_mass * float(self._idf_weights[token_id])
+
         _, merged_events, _, collision_events = self.clustering.update(
             token_id=token_id,
             embedding=token_embedding,
-            token_mass=token_mass,
+            token_mass=effective_mass,
         )
 
         # Remove merged-away labels from the record mapping
