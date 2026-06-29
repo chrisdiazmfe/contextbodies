@@ -199,7 +199,7 @@ def generate_gravitational(
             latency_ms = (time.perf_counter() - t0) * 1000
 
         # Update clustering with the selected token
-        tok_emb = token_embeddings[next_token].cpu().numpy()
+        tok_emb = token_embeddings[next_token].detach().cpu().numpy()
         sampler.post_step(token_id=next_token, token_embedding=tok_emb)
 
         escape_rate = (

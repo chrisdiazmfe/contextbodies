@@ -71,7 +71,7 @@ def generate(
         )
 
         # Feed selected token into clustering so bodies can form
-        tok_emb = token_embeddings[next_token].cpu().numpy()
+        tok_emb = token_embeddings[next_token].detach().cpu().numpy()
         sampler.post_step(token_id=next_token, token_embedding=tok_emb)
 
         generated.append(next_token)
