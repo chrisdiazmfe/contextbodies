@@ -124,10 +124,12 @@ def generate_temperature(
 ) -> tuple[str, float]:
     """Standard temperature sampling. Returns (text, elapsed_seconds)."""
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    attention_mask = torch.ones_like(input_ids)
     t0 = time.perf_counter()
     with torch.no_grad():
         out = model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_tokens,
             do_sample=True,
             temperature=temperature,
@@ -294,7 +296,7 @@ def main() -> None:
     print(f"Loading {args.model}...")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
     model.to(device)
     model.eval()
 
