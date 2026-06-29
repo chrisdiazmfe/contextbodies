@@ -162,10 +162,20 @@ contextbodies/
 ├── orbital_state.py         # Position/velocity/acceleration of the context vector
 ├── incremental_dbscan.py    # Online clustering — discovers emergent bodies token by token
 ├── gravitational_sampler.py # Core sampler — replaces temperature at inference time
+├── adaptive_g.py            # AdaptiveG — mass-normalized PI controller for G
 ├── generate.py              # Drop-in generation loop
 └── tests/
     ├── conftest.py
-    └── test_fragmentation.py
+    ├── test_context_body.py
+    ├── test_context_body_record.py
+    ├── test_context_body_store.py
+    ├── test_vector_backend.py
+    ├── test_orbital_state.py
+    ├── test_domain_classifier.py
+    ├── test_adaptive_g.py
+    ├── test_dbscan_new_features.py
+    ├── test_fragmentation.py
+    └── test_gravitational_sampler.py
 ```
 
 ## Dependencies
@@ -248,16 +258,20 @@ pytest tests/ -v -s
 
 ### What's tested
 
-| Class | What it covers |
+190 tests pass, 1 file skipped when `torch` is not installed (`test_gravitational_sampler.py` uses `pytest.importorskip`).
+
+| File | Classes / coverage |
 |---|---|
-| `TestFirstPrincipalComponent` | Power iteration correctness, unit norm, determinism |
-| `TestHasValley` | Clear bimodal, unimodal, uniform, strict threshold, flat histogram |
-| `TestCheckBimodality` | Bimodal detected, unimodal rejected, size gate, elongation gate |
-| `TestSplitBimodal` | Two clusters produced, original removed, no overlap, lineage, abort guard |
-| `TestConnectedComponents` | Disconnected groups, full partition, tight cluster, border-only cluster |
-| `TestFragmentCluster` | Cluster count, label removal, point relabeling, centroid history inherited |
-| `TestMaybeFragment` | Stable skip, missing label, connectivity priority, bimodality fallback |
-| `TestUpdateIntegration` | New body events, merge events, fragmentation events, noise, single cluster |
+| `test_context_body.py` | Accretion mass accumulation, centroid running mean, orbital radii, `classify()` tiers |
+| `test_context_body_record.py` | `to_metadata`/`from_metadata` round-trip, `resonance_partners` JSON serialization, graceful handling of missing/malformed fields |
+| `test_context_body_store.py` | All three stages of `record()` (dedup, re-emergence, new), gravitational ranking in `query_nearby()`, decay extinction, resonance write-through, per-query decay trigger |
+| `test_vector_backend.py` | `FAISSBackend` upsert/search/delete/update_metadata, 4-tuple return with `None` vector, domain filter, nearest-first ordering |
+| `test_orbital_state.py` | Initialize, velocity/acceleration updates, `momentum` and `speed_of_change` properties |
+| `test_domain_classifier.py` | Seed, EMA update, threshold fallback, add/remove anchor, `from_body_centroids()` |
+| `test_adaptive_g.py` | Mass normalization anchoring, PI escape-rate feedback, G_min/G_max clamping, domain multipliers, reset |
+| `test_dbscan_new_features.py` | Token mass accumulation, 4-tuple return shape, collision events, border-point bridge preservation |
+| `test_fragmentation.py` | Power iteration, bimodality detection, split correctness, connected components, fragmentation pipeline, full `update()` integration |
+| `test_gravitational_sampler.py` | Force formula and direction, recency factor, body grouping, resonance forces, inelastic collisions, `sample()` bias and escape rate tracking *(requires torch)* |
 
 ## Status
 
@@ -291,10 +305,11 @@ Early research implementation. Open issues are grouped below by area.
 - Benchmarking — no evaluation harness against temperature / top-p baselines; suggested metrics: perplexity, MAUVE, distinct-n, KL divergence from baseline distribution
 
 ### Testing
-- `GravitationalSampler` has no tests — force computation, escape threshold, orbital state updates, and active body sync all need coverage
-- `ContextBodyStore` has no tests — `record()` deduplication, `query_nearby()` ranking, and `decay()` extinction logic are untested
-- `VectorBackend` / `FAISSBackend` have no tests — upsert, search, delete, and update_metadata need coverage
-- `OrbitalState` has no tests — position, velocity, and acceleration update logic is untested
+- ✅ `GravitationalSampler` — force computation, recency factor, body grouping, resonance forces, inelastic collisions, `sample()` escape rate tracking (26 tests; requires `torch`)
+- ✅ `ContextBodyStore` — three-stage `record()` (dedup, re-emergence, new), gravitational ranking in `query_nearby()`, decay extinction, resonance write-through, per-query decay trigger
+- ✅ `VectorBackend` / `FAISSBackend` — upsert, search, delete, `update_metadata`, 4-tuple return, domain filter
+- ✅ `OrbitalState` — position, velocity, acceleration updates, momentum, speed_of_change
+- ✅ `ContextBody`, `ContextBodyRecord`, `DomainClassifier`, `AdaptiveG`, `IncrementalDBSCAN` — all covered
 
 ### Documentation
 - White paper — formal writeup of the methodology, theoretical grounding, and thesis; should cover the physics analogy, the gravitational sampling formula, emergent body detection, orbital mechanics, and comparison to existing sampling strategies
