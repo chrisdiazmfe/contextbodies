@@ -89,9 +89,11 @@ class GravitationalSampler:
         self.dbscan_eps = dbscan_eps
         self.dbscan_min_samples = dbscan_min_samples
 
-        # Cached numpy copy of the vocab embedding matrix.
-        # Populated on first sample() call; avoids a ~154MB GPU→CPU copy every step.
+        # Cached numpy copies of the vocab embedding matrix and its L2-normalized form.
+        # Populated on first sample() call; avoids a ~154MB GPU→CPU copy every step
+        # and pre-computes the normalized matrix used in vectorized field computation.
         self._cached_token_embs_np: np.ndarray | None = None
+        self._cached_token_embs_norm: np.ndarray | None = None  # row-normalized [vocab, D]
         self._cached_token_embs_id: int = -1
 
     # ------------------------------------------------------------------
@@ -351,33 +353,50 @@ class GravitationalSampler:
         Returns integer token index in [0, vocab_size).
         """
         vocab_size = logits.shape[0]
-        # Cache the numpy embedding matrix — it doesn't change across steps,
-        # but copying 50k × 768 floats from GPU every call costs ~150ms/step.
+
+        # Cache the raw and L2-normalized embedding matrix.
+        # The raw copy avoids ~150MB GPU→CPU transfer every step.
+        # The normalized form is precomputed here so cosine similarities reduce
+        # to a single matrix-vector multiply (embs_norm @ body_norm) per body.
         emb_id = id(token_embeddings)
         if self._cached_token_embs_id != emb_id or self._cached_token_embs_np is None:
             self._cached_token_embs_np = token_embeddings.detach().cpu().numpy()
+            norms = np.linalg.norm(self._cached_token_embs_np, axis=1, keepdims=True)
+            self._cached_token_embs_norm = self._cached_token_embs_np / (norms + 1e-8)
             self._cached_token_embs_id = emb_id
-        embs_np = self._cached_token_embs_np  # [vocab_size, D]
+        embs_norm = self._cached_token_embs_norm  # [vocab_size, D], row-normalized
 
         # Get virtual body groups
         groups = self._group_active_bodies()
 
-        # Compute gravitational field strength for each candidate token.
-        # Uses scalar field strength (G*m*M/r²) rather than force vector norm
-        # so tokens coincident with a body centroid correctly receive maximum
-        # bias rather than zero (force vector direction is undefined at r=0).
+        # Vectorized gravitational field strength: Φ_i = Σ_bodies G*m*M / r_i²
+        # where r_i = cosine distance from token i to body centroid.
+        # Replaces a 50k-iteration Python loop with matrix-vector multiplies.
         force_magnitudes = np.zeros(vocab_size)
-        for i in range(vocab_size):
-            tok_emb = embs_np[i]
-            # Scalar field strength from all virtual body groups
-            field = 0.0
-            for body_centroid, body_mass in groups:
-                field += self._gravitational_field_strength(
-                    tok_emb, token_mass, body_centroid, body_mass
-                )
-            # Vector resonance forces (midpoint attraction; direction meaningful)
-            resonance_force = self._compute_resonance_forces(tok_emb, token_mass)
-            force_magnitudes[i] = field + float(np.linalg.norm(resonance_force))
+
+        for body_centroid, body_mass in groups:
+            body_norm = body_centroid / (np.linalg.norm(body_centroid) + 1e-8)
+            cos_sims = embs_norm @ body_norm          # [vocab_size] dot products
+            r = np.maximum(1.0 - cos_sims, 1e-6)     # cosine distances, clipped
+            force_magnitudes += self.G * token_mass * body_mass / (r ** 2)
+
+        # Vectorized resonance field strength from co-active record pairs
+        records = [
+            body for _, body, _ in self.active_bodies
+            if isinstance(body, ContextBodyRecord)
+        ]
+        for i in range(len(records)):
+            for j in range(i + 1, len(records)):
+                ra, rb = records[i], records[j]
+                score = ra.resonance_partners.get(str(rb.id), 0.0)
+                if score < self.resonance_threshold:
+                    continue
+                midpoint = (ra.centroid + rb.centroid) / 2.0
+                joint_mass = float(np.sqrt(ra.mass * rb.mass)) * score
+                mid_norm = midpoint / (np.linalg.norm(midpoint) + 1e-8)
+                cos_sims = embs_norm @ mid_norm
+                r = np.maximum(1.0 - cos_sims, 1e-6)
+                force_magnitudes += self.G * token_mass * joint_mass / (r ** 2)
 
         # Escape rate tracking
         escape_count = int(np.sum(force_magnitudes < self.escape_threshold))
