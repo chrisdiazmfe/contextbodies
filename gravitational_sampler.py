@@ -48,7 +48,7 @@ class GravitationalSampler:
         self,
         body_store: ContextBodyStore,
         G: float = 1.0,
-        escape_threshold: float = 0.1,
+        escape_threshold: float = 0.01,
         stability_threshold: float = 0.8,
         resonance_threshold: float = 0.3,
         amplification_threshold: float = 0.2,
