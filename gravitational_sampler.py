@@ -383,7 +383,19 @@ class GravitationalSampler:
         token_mass: float = 1.0,
     ) -> int:
         """
-        Sample one token index from gravity-biased logits.
+        Sample one token index using multiplicative gravitational reweighting.
+
+        Gravity amplifies the model's own probability distribution rather than
+        overriding it with an additive logit bias. Tokens the model assigns
+        near-zero probability stay near-zero regardless of gravitational pull.
+        This preserves diversity while still steering sampling toward body regions.
+
+        Pipeline:
+            1. Compute raw softmax probabilities from the model's logits.
+            2. Compute gravitational field strength per token (vectorized).
+            3. Apply IDF weights to the field (suppresses common tokens).
+            4. Multiply probabilities by (1 + field_strength) and renormalize.
+            5. Sample from the reweighted distribution.
 
         Returns integer token index in [0, vocab_size).
         """
@@ -433,16 +445,33 @@ class GravitationalSampler:
                 r = np.maximum(1.0 - cos_sims, 1e-6)
                 force_magnitudes += self.G * token_mass * joint_mass / (r ** 2)
 
-        # Escape rate tracking
+        # Apply IDF to the output field so common tokens (EOS, articles,
+        # punctuation) receive reduced gravitational amplification even when
+        # they are geometrically close to a body centroid.  This is independent
+        # of the IDF weighting already applied at body formation in post_step();
+        # together they suppress common tokens at both ingestion and sampling.
+        if self._idf_weights is not None and len(self._idf_weights) == vocab_size:
+            force_magnitudes *= self._idf_weights
+
+        # Escape rate tracking (after IDF so it reflects effective field strength)
         escape_count = int(np.sum(force_magnitudes < self.escape_threshold))
         self._last_escape_count = escape_count
         self._last_vocab_size = vocab_size
 
-        # Bias logits
-        bias = torch.tensor(force_magnitudes, dtype=logits.dtype, device=logits.device)
-        adjusted_logits = logits + bias
+        # Multiplicative reweighting: start from the model's own distribution
+        # and amplify tokens near active bodies, rather than adding a flat bias
+        # to raw logits.  Tokens with near-zero model probability stay near-zero
+        # regardless of gravitational pull — the model's diversity is preserved.
+        probs = torch.softmax(logits, dim=-1)
+        if np.any(force_magnitudes > 0):
+            gravity_weights = torch.tensor(
+                1.0 + force_magnitudes,
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            probs = probs * gravity_weights
+            probs = probs / probs.sum()
 
-        probs = torch.softmax(adjusted_logits, dim=-1)
         token_idx = int(torch.multinomial(probs, num_samples=1).item())
         return token_idx
 
