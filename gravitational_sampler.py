@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from adaptive_dbscan import AdaptiveDBSCAN
 from adaptive_g import AdaptiveG
 from context_body import ContextBody
 from context_body_record import ContextBodyRecord
@@ -54,6 +55,7 @@ class GravitationalSampler:
         collision_distance: float = 0.1,
         recency_decay_lambda: float = 0.0,
         adaptive_g: AdaptiveG | None = None,
+        adaptive_dbscan: AdaptiveDBSCAN | None = None,
         domain: str = "",
         domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -69,6 +71,7 @@ class GravitationalSampler:
         self.collision_distance = collision_distance
         self.recency_decay_lambda = recency_decay_lambda
         self.adaptive_g = adaptive_g
+        self.adaptive_dbscan = adaptive_dbscan
         self.domain = domain
         self.domain_classifier = domain_classifier
         self.device = device
@@ -152,9 +155,18 @@ class GravitationalSampler:
 
         self.orbital_state = OrbitalState.initialize(initial_pos)
 
+        # Derive eps from the prompt's embedding geometry if adaptive_dbscan
+        # is configured; otherwise fall back to the fixed dbscan_eps param.
+        if self.adaptive_dbscan is not None:
+            eps = self.adaptive_dbscan.initialize_eps(embs_np)
+            min_samples = self.adaptive_dbscan.min_samples
+        else:
+            eps = self.dbscan_eps
+            min_samples = self.dbscan_min_samples
+
         self.clustering = IncrementalDBSCAN(
-            eps=self.dbscan_eps,
-            min_samples=self.dbscan_min_samples,
+            eps=eps,
+            min_samples=min_samples,
             dim=embedding_dim,
         )
 
@@ -559,6 +571,11 @@ class GravitationalSampler:
 
         # Inelastic collision check within active bodies
         self._check_collisions()
+
+        # Update adaptive DBSCAN eps toward target body count
+        if self.adaptive_dbscan is not None and self.clustering is not None:
+            new_eps = self.adaptive_dbscan.update(len(self.active_bodies))
+            self.clustering.eps = new_eps
 
         # Update adaptive G if configured
         if self.adaptive_g is not None:

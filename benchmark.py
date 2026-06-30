@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from context_body_store import ContextBodyStore
 from gravitational_sampler import GravitationalSampler
 from adaptive_g import AdaptiveG
+from adaptive_dbscan import AdaptiveDBSCAN
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +250,9 @@ def print_summary(results: dict) -> None:
         print(f"  escape_rate_tgt: {cfg['escape_rate_target']}")
     if cfg.get("mass_norm_strength") is not None:
         print(f"  mass_norm_str  : {cfg['mass_norm_strength']}")
+    if cfg.get("adaptive_dbscan"):
+        print(f"  target_bodies  : {cfg['target_bodies']}")
+        print(f"  eps_percentile : {cfg['eps_percentile']}")
     print()
     print(f"  {'metric':<28} {'temperature':>14} {'gravitational':>14}")
     print(f"  {'-'*28} {'-'*14} {'-'*14}")
@@ -311,9 +315,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-idf", action="store_true",
                    help="Disable IDF mass normalization (use raw token_mass for all tokens)")
     p.add_argument("--dbscan-eps", type=float, default=0.3,
-                   help="DBSCAN epsilon: cosine distance radius for cluster membership (default: 0.3)")
+                   help="DBSCAN epsilon: cosine distance radius for cluster membership (default: 0.3). "
+                        "Ignored when --adaptive-dbscan is set.")
     p.add_argument("--dbscan-min-samples", type=int, default=3,
                    help="DBSCAN min_samples: tokens needed to form a cluster core (default: 3)")
+    p.add_argument("--adaptive-dbscan", action="store_true",
+                   help="Enable AdaptiveDBSCAN: derives eps from prompt embedding geometry "
+                        "and adjusts it toward --target-bodies during generation.")
+    p.add_argument("--target-bodies", type=int, default=3,
+                   help="AdaptiveDBSCAN target number of simultaneously active bodies (default: 3).")
+    p.add_argument("--eps-percentile", type=float, default=20.0,
+                   help="Percentile of pairwise context distances used to seed eps (default: 20.0).")
     p.add_argument("--output", default="benchmark_results",
                    help="Output directory (default: benchmark_results)")
     p.add_argument("--device", default=None,
@@ -408,6 +420,12 @@ def main() -> None:
         mass_norm_strength=args.mass_norm_strength,
     ) if args.adaptive_g else None
 
+    adaptive_dbscan = AdaptiveDBSCAN(
+        target_bodies=args.target_bodies,
+        eps_percentile=args.eps_percentile,
+        min_samples=args.dbscan_min_samples,
+    ) if args.adaptive_dbscan else None
+
     # Precompute IDF weights once from the model's unconditional distribution.
     # Shared across all sampler instances — only depends on the model, not the prompt.
     idf_weights = None
@@ -433,6 +451,7 @@ def main() -> None:
                 escape_threshold=args.escape_threshold,
                 recency_decay_lambda=args.recency_lambda,
                 adaptive_g=adaptive_g,
+                adaptive_dbscan=adaptive_dbscan,
                 device=device,
                 dbscan_eps=args.dbscan_eps,
                 dbscan_min_samples=args.dbscan_min_samples,
@@ -498,6 +517,9 @@ def main() -> None:
         "adaptive_g":          args.adaptive_g,
         "escape_rate_target":  args.escape_rate_target if args.adaptive_g else None,
         "mass_norm_strength":  args.mass_norm_strength if args.adaptive_g else None,
+        "adaptive_dbscan":     args.adaptive_dbscan,
+        "target_bodies":       args.target_bodies if args.adaptive_dbscan else None,
+        "eps_percentile":      args.eps_percentile if args.adaptive_dbscan else None,
         "device":              device,
     }
 
