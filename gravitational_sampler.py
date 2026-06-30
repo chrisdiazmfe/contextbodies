@@ -48,7 +48,7 @@ class GravitationalSampler:
         self,
         body_store: ContextBodyStore,
         G: float = 1.0,
-        escape_threshold: float = 0.01,
+        escape_threshold: float = 0.1,
         stability_threshold: float = 0.8,
         resonance_threshold: float = 0.3,
         amplification_threshold: float = 0.2,
@@ -465,21 +465,12 @@ class GravitationalSampler:
         if self._idf_weights is not None and len(self._idf_weights) == vocab_size:
             force_magnitudes *= self._idf_weights
 
-        # Escape rate tracking — relative threshold for multiplicative reweighting.
-        # In the additive regime, force magnitudes varied from near-zero (distant
-        # tokens) to enormous (tokens at the body centroid), so an absolute
-        # threshold made sense. With multiplicative reweighting, even the most
-        # distant token receives F = G * m_body / r_max² which can be >> 0.01,
-        # causing escape_rate to collapse to ~0 for any active body.
-        # Relative threshold: a token escapes if its force is below
-        # escape_threshold * max_force, i.e. it's in the bottom fraction of the
-        # field. This stays meaningful across all G scales.
-        max_force = float(force_magnitudes.max()) if groups else 0.0
-        if max_force > 0:
-            effective_threshold = self.escape_threshold * max_force
-            escape_count = int(np.sum(force_magnitudes < effective_threshold))
-        else:
-            escape_count = vocab_size   # no bodies → all tokens escape
+        # Escape rate tracking.
+        # With multiplicative reweighting, weight = 1.0 + force_magnitude.
+        # A token "escapes" gravity if its amplification is negligible, i.e.
+        # force_magnitude < escape_threshold. The threshold should be calibrated
+        # in multiplicative terms: 0.1 means weight < 1.1 (< 10% amplification).
+        escape_count = int(np.sum(force_magnitudes < self.escape_threshold))
         self._last_escape_count = escape_count
         self._last_vocab_size = vocab_size
 

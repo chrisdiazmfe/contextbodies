@@ -298,11 +298,11 @@ def parse_args() -> argparse.Namespace:
                    help="Temperature for baseline sampler (default: 0.8)")
     p.add_argument("--G", type=float, default=1.0,
                    help="Gravitational constant (default: 1.0)")
-    p.add_argument("--escape-threshold", type=float, default=0.01,
-                   help="Relative escape threshold (default: 0.01). A token escapes "
-                        "gravity if its force magnitude is below escape_threshold × "
-                        "max_force. 0.01 = bottom 1%% of the field escapes; 0.10 = "
-                        "bottom 10%% escapes. Higher values = looser constraint.")
+    p.add_argument("--escape-threshold", type=float, default=0.1,
+                   help="Escape threshold for multiplicative reweighting (default: 0.1). "
+                        "A token escapes gravity if force_magnitude < threshold, i.e. "
+                        "its weight (1 + force) < 1 + threshold. 0.1 = less than 10%% "
+                        "amplification. Higher values = more tokens escape.")
     p.add_argument("--adaptive-g", action="store_true",
                    help="Enable AdaptiveG controller")
     p.add_argument("--escape-rate-target", type=float, default=0.7,
