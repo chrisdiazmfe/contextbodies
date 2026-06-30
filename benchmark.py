@@ -388,6 +388,24 @@ def main() -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Config dict — built early so temperature-only mode can use it
+    config = {
+        "model":               args.model,
+        "num_prompts":         len(prompts),
+        "max_tokens":          args.max_tokens,
+        "runs":                args.runs,
+        "temperature":         args.temperature,
+        "G":                   args.G,
+        "adaptive_g":          args.adaptive_g,
+        "escape_rate_target":  args.escape_rate_target if args.adaptive_g else None,
+        "mass_norm_strength":  args.mass_norm_strength if args.adaptive_g else None,
+        "adaptive_dbscan":     args.adaptive_dbscan,
+        "target_bodies":       args.target_bodies if args.adaptive_dbscan else None,
+        "eps_percentile":      args.eps_percentile if args.adaptive_dbscan else None,
+        "eps_adjustment_rate": args.eps_adjustment_rate if args.adaptive_dbscan else None,
+        "device":              device,
+    }
+
     # -------------------------------------------------------------------
     # Temperature baseline
     # -------------------------------------------------------------------
@@ -543,23 +561,6 @@ def main() -> None:
     # -------------------------------------------------------------------
     # Assemble and save
     # -------------------------------------------------------------------
-    config = {
-        "model":               args.model,
-        "num_prompts":         len(prompts),
-        "max_tokens":          args.max_tokens,
-        "runs":                args.runs,
-        "temperature":         args.temperature,
-        "G":                   args.G,
-        "adaptive_g":          args.adaptive_g,
-        "escape_rate_target":  args.escape_rate_target if args.adaptive_g else None,
-        "mass_norm_strength":  args.mass_norm_strength if args.adaptive_g else None,
-        "adaptive_dbscan":     args.adaptive_dbscan,
-        "target_bodies":       args.target_bodies if args.adaptive_dbscan else None,
-        "eps_percentile":      args.eps_percentile if args.adaptive_dbscan else None,
-        "eps_adjustment_rate": args.eps_adjustment_rate if args.adaptive_dbscan else None,
-        "device":              device,
-    }
-
     full_results = {
         "config":        config,
         "temperature":   temp_results,
