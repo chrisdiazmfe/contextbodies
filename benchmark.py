@@ -248,6 +248,8 @@ def print_summary(results: dict) -> None:
     print(f"  temperature    : {cfg['temperature']}")
     print(f"  G              : {cfg['G']}")
     print(f"  adaptive_g     : {cfg['adaptive_g']}")
+    if cfg.get("escape_rate_target") is not None:
+        print(f"  escape_rate_tgt: {cfg['escape_rate_target']}")
     print()
     print(f"  {'metric':<28} {'temperature':>14} {'gravitational':>14}")
     print(f"  {'-'*28} {'-'*14} {'-'*14}")
@@ -296,6 +298,10 @@ def parse_args() -> argparse.Namespace:
                    help="Escape threshold (default: 0.01)")
     p.add_argument("--adaptive-g", action="store_true",
                    help="Enable AdaptiveG controller")
+    p.add_argument("--escape-rate-target", type=float, default=0.7,
+                   help="AdaptiveG target escape rate (default: 0.7). Lower values "
+                        "allow gravity to influence more tokens; 0.15-0.20 works "
+                        "well with multiplicative reweighting.")
     p.add_argument("--recency-lambda", type=float, default=0.0,
                    help="Recency decay lambda (default: 0.0 = disabled)")
     p.add_argument("--no-idf", action="store_true",
@@ -392,7 +398,7 @@ def main() -> None:
 
     embedding_dim = model.get_input_embeddings().weight.shape[1]
 
-    adaptive_g = AdaptiveG(G_base=args.G) if args.adaptive_g else None
+    adaptive_g = AdaptiveG(G_base=args.G, escape_rate_target=args.escape_rate_target) if args.adaptive_g else None
 
     # Precompute IDF weights once from the model's unconditional distribution.
     # Shared across all sampler instances — only depends on the model, not the prompt.
@@ -475,14 +481,15 @@ def main() -> None:
     # Assemble and save
     # -------------------------------------------------------------------
     config = {
-        "model":       args.model,
-        "num_prompts": len(prompts),
-        "max_tokens":  args.max_tokens,
-        "runs":        args.runs,
-        "temperature": args.temperature,
-        "G":           args.G,
-        "adaptive_g":  args.adaptive_g,
-        "device":      device,
+        "model":               args.model,
+        "num_prompts":         len(prompts),
+        "max_tokens":          args.max_tokens,
+        "runs":                args.runs,
+        "temperature":         args.temperature,
+        "G":                   args.G,
+        "adaptive_g":          args.adaptive_g,
+        "escape_rate_target":  args.escape_rate_target if args.adaptive_g else None,
+        "device":              device,
     }
 
     full_results = {
