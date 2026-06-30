@@ -253,6 +253,7 @@ def print_summary(results: dict) -> None:
     if cfg.get("adaptive_dbscan"):
         print(f"  target_bodies  : {cfg['target_bodies']}")
         print(f"  eps_percentile : {cfg['eps_percentile']}")
+        print(f"  eps_adj_rate   : {cfg['eps_adjustment_rate']}")
     print()
     print(f"  {'metric':<28} {'temperature':>14} {'gravitational':>14}")
     print(f"  {'-'*28} {'-'*14} {'-'*14}")
@@ -326,6 +327,9 @@ def parse_args() -> argparse.Namespace:
                    help="AdaptiveDBSCAN target number of simultaneously active bodies (default: 3).")
     p.add_argument("--eps-percentile", type=float, default=20.0,
                    help="Percentile of pairwise context distances used to seed eps (default: 20.0).")
+    p.add_argument("--eps-adjustment-rate", type=float, default=0.01,
+                   help="How much eps changes per step when body count is off-target (default: 0.01). "
+                        "Lower values = smoother but slower adaptation.")
     p.add_argument("--output", default="benchmark_results",
                    help="Output directory (default: benchmark_results)")
     p.add_argument("--device", default=None,
@@ -424,6 +428,7 @@ def main() -> None:
         target_bodies=args.target_bodies,
         eps_percentile=args.eps_percentile,
         min_samples=args.dbscan_min_samples,
+        adjustment_rate=args.eps_adjustment_rate,
     ) if args.adaptive_dbscan else None
 
     # Precompute IDF weights once from the model's unconditional distribution.
@@ -520,6 +525,7 @@ def main() -> None:
         "adaptive_dbscan":     args.adaptive_dbscan,
         "target_bodies":       args.target_bodies if args.adaptive_dbscan else None,
         "eps_percentile":      args.eps_percentile if args.adaptive_dbscan else None,
+        "eps_adjustment_rate": args.eps_adjustment_rate if args.adaptive_dbscan else None,
         "device":              device,
     }
 
