@@ -16,6 +16,8 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -574,7 +576,6 @@ def main() -> None:
     print_summary(full_results)
 
     # Save text summary
-    import io, contextlib
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         print_summary(full_results)
