@@ -204,7 +204,7 @@ class AdaptiveG:
         if not active_bodies:
             return 1.0
 
-        masses = [body.mass for _, body, _ in active_bodies if body.mass > 0]
+        masses = [body.mass for body in active_bodies if body.mass > 0]
         if not masses:
             return 1.0
 
