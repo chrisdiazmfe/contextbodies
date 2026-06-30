@@ -33,9 +33,6 @@ from context_body_store import ContextBodyStore
 from gravitational_sampler import GravitationalSampler
 from adaptive_g import AdaptiveG
 
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
-
 
 # ---------------------------------------------------------------------------
 # Default prompt set — diverse topics for broad coverage
