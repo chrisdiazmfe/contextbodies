@@ -234,7 +234,7 @@ def generate_gravitational(
 def print_summary(results: dict) -> None:
     cfg = results["config"]
     temp = results["temperature"]
-    grav = results["gravitational"]
+    grav = results.get("gravitational")
 
     print("\n" + "=" * 60)
     print("  contextbodies benchmark")
@@ -244,38 +244,51 @@ def print_summary(results: dict) -> None:
     print(f"  max tokens     : {cfg['max_tokens']}")
     print(f"  runs per prompt: {cfg['runs']}")
     print(f"  temperature    : {cfg['temperature']}")
-    print(f"  G              : {cfg['G']}")
-    print(f"  adaptive_g     : {cfg['adaptive_g']}")
-    if cfg.get("escape_rate_target") is not None:
-        print(f"  escape_rate_tgt: {cfg['escape_rate_target']}")
-    if cfg.get("mass_norm_strength") is not None:
-        print(f"  mass_norm_str  : {cfg['mass_norm_strength']}")
-    if cfg.get("adaptive_dbscan"):
-        print(f"  target_bodies  : {cfg['target_bodies']}")
-        print(f"  eps_percentile : {cfg['eps_percentile']}")
-        print(f"  eps_adj_rate   : {cfg['eps_adjustment_rate']}")
+    if grav is not None:
+        print(f"  G              : {cfg['G']}")
+        print(f"  adaptive_g     : {cfg['adaptive_g']}")
+        if cfg.get("escape_rate_target") is not None:
+            print(f"  escape_rate_tgt: {cfg['escape_rate_target']}")
+        if cfg.get("mass_norm_strength") is not None:
+            print(f"  mass_norm_str  : {cfg['mass_norm_strength']}")
+        if cfg.get("adaptive_dbscan"):
+            print(f"  target_bodies  : {cfg['target_bodies']}")
+            print(f"  eps_percentile : {cfg['eps_percentile']}")
+            print(f"  eps_adj_rate   : {cfg['eps_adjustment_rate']}")
     print()
-    print(f"  {'metric':<28} {'temperature':>14} {'gravitational':>14}")
-    print(f"  {'-'*28} {'-'*14} {'-'*14}")
 
-    def row(label, t_val, g_val, fmt=".4f"):
-        print(f"  {label:<28} {t_val:>14{fmt}} {g_val:>14{fmt}}")
+    if grav is None:
+        # Temperature-only mode
+        print(f"  {'metric':<28} {'temperature':>14}")
+        print(f"  {'-'*28} {'-'*14}")
+        print(f"  {'perplexity':<28} {temp['perplexity']:>14.4f}")
+        print(f"  {'distinct-1':<28} {temp['distinct_1']:>14.4f}")
+        print(f"  {'distinct-2':<28} {temp['distinct_2']:>14.4f}")
+        print(f"  {'avg length (words)':<28} {temp['avg_length']:>14.1f}")
+        print(f"  {'total time (s)':<28} {temp['total_time_s']:>14.2f}")
+        print(f"  {'ms / token (mean)':<28} {temp['ms_per_token']:>14.1f}")
+    else:
+        print(f"  {'metric':<28} {'temperature':>14} {'gravitational':>14}")
+        print(f"  {'-'*28} {'-'*14} {'-'*14}")
 
-    row("perplexity",         temp["perplexity"],   grav["perplexity"])
-    row("distinct-1",         temp["distinct_1"],   grav["distinct_1"])
-    row("distinct-2",         temp["distinct_2"],   grav["distinct_2"])
-    row("avg length (words)", temp["avg_length"],   grav["avg_length"],  ".1f")
-    row("total time (s)",     temp["total_time_s"], grav["total_time_s"], ".2f")
-    row("ms / token (mean)",  temp["ms_per_token"], grav["ms_per_token"], ".1f")
+        def row(label, t_val, g_val, fmt=".4f"):
+            print(f"  {label:<28} {t_val:>14{fmt}} {g_val:>14{fmt}}")
 
-    if grav.get("step_metrics_summary"):
-        sm = grav["step_metrics_summary"]
-        print()
-        print("  gravitational system metrics (mean across all steps):")
-        print(f"  {'escape rate':<28} {sm['mean_escape_rate']:>14.4f}")
-        print(f"  {'active bodies':<28} {sm['mean_active_bodies']:>14.1f}")
-        if sm.get("mean_G_eff") is not None:
-            print(f"  {'G_eff':<28} {sm['mean_G_eff']:>14.4f}")
+        row("perplexity",         temp["perplexity"],   grav["perplexity"])
+        row("distinct-1",         temp["distinct_1"],   grav["distinct_1"])
+        row("distinct-2",         temp["distinct_2"],   grav["distinct_2"])
+        row("avg length (words)", temp["avg_length"],   grav["avg_length"],  ".1f")
+        row("total time (s)",     temp["total_time_s"], grav["total_time_s"], ".2f")
+        row("ms / token (mean)",  temp["ms_per_token"], grav["ms_per_token"], ".1f")
+
+        if grav.get("step_metrics_summary"):
+            sm = grav["step_metrics_summary"]
+            print()
+            print("  gravitational system metrics (mean across all steps):")
+            print(f"  {'escape rate':<28} {sm['mean_escape_rate']:>14.4f}")
+            print(f"  {'active bodies':<28} {sm['mean_active_bodies']:>14.1f}")
+            if sm.get("mean_G_eff") is not None:
+                print(f"  {'G_eff':<28} {sm['mean_G_eff']:>14.4f}")
 
     print("=" * 60 + "\n")
 
@@ -296,6 +309,9 @@ def parse_args() -> argparse.Namespace:
                    help="Runs per prompt per sampler (results averaged)")
     p.add_argument("--temperature", type=float, default=0.8,
                    help="Temperature for baseline sampler (default: 0.8)")
+    p.add_argument("--temperature-only", action="store_true",
+                   help="Run only the temperature baseline, skip gravitational sampling. "
+                        "Use to sweep temperature values for a matched-perplexity comparison.")
     p.add_argument("--G", type=float, default=1.0,
                    help="Gravitational constant (default: 1.0)")
     p.add_argument("--escape-threshold", type=float, default=0.01,
@@ -411,8 +427,20 @@ def main() -> None:
     }
 
     # -------------------------------------------------------------------
-    # Gravitational sampling
+    # Gravitational sampling (skipped with --temperature-only)
     # -------------------------------------------------------------------
+    if args.temperature_only:
+        print("\nTemperature-only mode: skipping gravitational sampling.")
+        print_summary({"config": config, "temperature": temp_results, "gravitational": None})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_summary({"config": config, "temperature": temp_results, "gravitational": None})
+        (out_dir / "summary.txt").write_text(buf.getvalue())
+        (out_dir / "results.json").write_text(json.dumps(
+            {"config": config, "temperature": temp_results}, indent=2))
+        print(f"Results saved to {out_dir}/")
+        return
+
     print("Running gravitational sampling...")
     grav_texts: list[str] = []
     grav_times: list[float] = []
