@@ -250,6 +250,8 @@ def print_summary(results: dict) -> None:
     print(f"  adaptive_g     : {cfg['adaptive_g']}")
     if cfg.get("escape_rate_target") is not None:
         print(f"  escape_rate_tgt: {cfg['escape_rate_target']}")
+    if cfg.get("mass_norm_strength") is not None:
+        print(f"  mass_norm_str  : {cfg['mass_norm_strength']}")
     print()
     print(f"  {'metric':<28} {'temperature':>14} {'gravitational':>14}")
     print(f"  {'-'*28} {'-'*14} {'-'*14}")
@@ -302,6 +304,11 @@ def parse_args() -> argparse.Namespace:
                    help="AdaptiveG target escape rate (default: 0.7). Lower values "
                         "allow gravity to influence more tokens; 0.15-0.20 works "
                         "well with multiplicative reweighting.")
+    p.add_argument("--mass-norm-strength", type=float, default=1.0,
+                   help="AdaptiveG mass normalization strength (default: 1.0). "
+                        "1.0=full inverse normalization, 0.5=square-root dampening, "
+                        "0.0=disabled. Reduce when using multiplicative reweighting "
+                        "since large body mass is less dangerous than with additive bias.")
     p.add_argument("--recency-lambda", type=float, default=0.0,
                    help="Recency decay lambda (default: 0.0 = disabled)")
     p.add_argument("--no-idf", action="store_true",
@@ -398,7 +405,11 @@ def main() -> None:
 
     embedding_dim = model.get_input_embeddings().weight.shape[1]
 
-    adaptive_g = AdaptiveG(G_base=args.G, escape_rate_target=args.escape_rate_target) if args.adaptive_g else None
+    adaptive_g = AdaptiveG(
+        G_base=args.G,
+        escape_rate_target=args.escape_rate_target,
+        mass_norm_strength=args.mass_norm_strength,
+    ) if args.adaptive_g else None
 
     # Precompute IDF weights once from the model's unconditional distribution.
     # Shared across all sampler instances — only depends on the model, not the prompt.
@@ -489,6 +500,7 @@ def main() -> None:
         "G":                   args.G,
         "adaptive_g":          args.adaptive_g,
         "escape_rate_target":  args.escape_rate_target if args.adaptive_g else None,
+        "mass_norm_strength":  args.mass_norm_strength if args.adaptive_g else None,
         "device":              device,
     }
 
