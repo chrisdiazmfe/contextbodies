@@ -211,6 +211,75 @@ class ContextBodyStore:
 
         return extinct
 
+    def merge_records(
+        self,
+        incoming_id: str,
+        incoming_centroid: np.ndarray,
+        existing_record: "ContextBodyRecord",
+    ) -> None:
+        """
+        Inelastic collision between two stored records (cross-session).
+
+        The incoming record is absorbed into the existing record:
+          - Centroid becomes the mass-weighted average of both.
+          - Masses are summed.
+          - Resonance partners are transferred from incoming to existing.
+          - The incoming record is deleted from the backend.
+
+        Called by GravitationalSampler when a newly persisted local body
+        overlaps (within collision_distance) with a store record loaded from
+        a previous session.
+
+        Parameters
+        ----------
+        incoming_id       : record ID of the newly persisted body (absorbed)
+        incoming_centroid : centroid of the incoming body
+        existing_record   : the surviving ContextBodyRecord (already loaded
+                            into active_bodies, so its centroid is known)
+        """
+        existing_id = str(existing_record.id)
+
+        incoming_mass = self._record_mass.get(incoming_id, 0.0)
+        existing_mass = self._record_mass.get(existing_id, existing_record.mass)
+        total_mass = incoming_mass + existing_mass
+        if total_mass < 1e-8:
+            return
+
+        # Mass-weighted centroid
+        merged_centroid = (
+            incoming_centroid * incoming_mass
+            + existing_record.centroid * existing_mass
+        ) / total_mass
+
+        # Re-upsert the surviving record with the merged centroid and summed
+        # mass. upsert() removes the stale FAISS vector before reinserting, so
+        # the ANN index stays consistent without a separate delete step.
+        now = datetime.utcnow()
+        merged_meta = existing_record.to_metadata()
+        merged_meta["mass"] = total_mass
+        merged_meta["last_seen"] = now.isoformat()
+
+        self.backend.upsert(
+            record_id=existing_id,
+            vector=merged_centroid,
+            metadata=merged_meta,
+        )
+        self._record_mass[existing_id] = total_mass
+        self._record_last_seen[existing_id] = now
+
+        # Transfer resonance partners from incoming to existing.
+        # If both records already share a partner, scores are additive
+        # (capped by record_resonance's max_score).
+        for partner_id, score in self._resonance_cache.get(incoming_id, {}).items():
+            if partner_id != existing_id:
+                self.record_resonance(existing_id, partner_id, delta=score)
+
+        # Delete the absorbed record.
+        self.backend.delete([incoming_id])
+        self._record_mass.pop(incoming_id, None)
+        self._record_last_seen.pop(incoming_id, None)
+        self._resonance_cache.pop(incoming_id, None)
+
     def record_resonance(
         self,
         id_a: str,

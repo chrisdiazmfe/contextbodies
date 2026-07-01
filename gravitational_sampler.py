@@ -354,6 +354,59 @@ class GravitationalSampler:
 
         return force
 
+    def _check_cross_session_collisions(self) -> None:
+        """
+        Inelastic collision between newly persisted local bodies and store
+        records loaded from previous sessions.
+
+        After a local body (ContextBody, label>=0) is persisted to the store,
+        we check whether it overlaps with any ContextBodyRecord already loaded
+        into active_bodies. If the cosine distance is below collision_distance,
+        the two records are merged in the store: masses sum, centroid becomes
+        the mass-weighted average, and the local body's label is redirected to
+        the surviving store record.
+
+        This ensures concepts that recur across sessions accumulate mass and
+        become progressively stronger attractors, rather than spawning duplicate
+        records on every re-encounter.
+        """
+        # Persisted local bodies: those with a label in _label_record_ids
+        persisted = {
+            label: (body, self._label_record_ids[label])
+            for label, body, _ in self.active_bodies
+            if isinstance(body, ContextBody) and label in self._label_record_ids
+        }
+        if not persisted:
+            return
+
+        # Store records from previous sessions currently in active_bodies
+        store_entries = [
+            body
+            for _, body, _ in self.active_bodies
+            if isinstance(body, ContextBodyRecord)
+        ]
+        if not store_entries:
+            return
+
+        for label, (local_body, local_id) in persisted.items():
+            ca = local_body.centroid / (np.linalg.norm(local_body.centroid) + 1e-8)
+            for store_rec in store_entries:
+                if str(store_rec.id) == local_id:
+                    continue  # same record — shouldn't occur but be safe
+                cb = store_rec.centroid / (np.linalg.norm(store_rec.centroid) + 1e-8)
+                dist = float(1.0 - np.dot(ca, cb))
+                if dist < self.collision_distance:
+                    # Cross-session inelastic collision: absorb the new local
+                    # record into the older store record.
+                    self.body_store.merge_records(
+                        incoming_id=local_id,
+                        incoming_centroid=local_body.centroid,
+                        existing_record=store_rec,
+                    )
+                    # Redirect this label to the surviving store record.
+                    self._label_record_ids[label] = str(store_rec.id)
+                    break  # each local body collides at most once
+
     def _check_collisions(self) -> None:
         """
         Inelastic collision: merge any two ContextBody objects in active_bodies
@@ -672,8 +725,12 @@ class GravitationalSampler:
             if id_a and id_b:
                 self.body_store.record_resonance(id_a, id_b, delta=0.2)
 
-        # Inelastic collision check within active bodies
+        # Inelastic collision check within active bodies (same session)
         self._check_collisions()
+
+        # Cross-session collision check: merge newly persisted local bodies
+        # with overlapping store records from previous sessions
+        self._check_cross_session_collisions()
 
         # Update adaptive clustering radius toward target body count
         if self.adaptive_dbscan is not None:
