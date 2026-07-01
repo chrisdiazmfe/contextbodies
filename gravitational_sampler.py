@@ -447,34 +447,25 @@ class GravitationalSampler:
         # Get virtual body groups
         groups = self._group_active_bodies()
 
-        # Vectorized gravitational field strength: Φ_i = Σ_bodies G*m*M / r_i²
-        # where r_i = cosine distance from token i to body centroid.
-        # Replaces a 50k-iteration Python loop with matrix-vector multiplies.
+        # Gravitational field from local context bodies — GPU torch path.
         #
-        # r_min=0.1 matches the universe field floor — prevents singularities for
-        # tokens that land exactly on a body centroid (cosine distance ≈ 0).
-        # Without this floor, a single close token gets force ∝ 1/(1e-6)² = 10¹²,
-        # overwhelming everything else in the field.
+        # All body centroids and masses are stacked into tensors so the entire
+        # field can be computed as a single [vocab, D] @ [D, n_bodies] matmul,
+        # matching the approach used in Universe.compute_field_torch().
         #
-        # Force is normalized by n_local_bodies after accumulation, mirroring how
-        # Universe.compute_field() divides by n_bodies. This keeps the total local
-        # field contribution comparable in magnitude to the universe background
-        # regardless of how many bodies are active.
-        force_magnitudes = np.zeros(vocab_size)
-        n_local_bodies = len(groups)
+        # r_min=0.1 prevents singularities for tokens at their home centroid.
+        # Forces are normalized by n_local_sources so the total local field
+        # magnitude is comparable to the universe background regardless of how
+        # many bodies are active.
+        force_magnitudes_t: torch.Tensor | None = None
 
-        for body_centroid, body_mass in groups:
-            body_norm = body_centroid / (np.linalg.norm(body_centroid) + 1e-8)
-            cos_sims = embs_norm @ body_norm          # [vocab_size] dot products
-            r = np.maximum(1.0 - cos_sims, 0.1)      # r_min=0.1, matching universe
-            force_magnitudes += self.G * token_mass * body_mass / (r ** 2)
-
-        # Vectorized resonance field strength from co-active record pairs
+        # Build resonance sources (midpoints + joint masses) before the matmul.
         records = [
             body for _, body, _ in self.active_bodies
             if isinstance(body, ContextBodyRecord)
         ]
-        n_resonance_pairs = 0
+        resonance_centroids: list[np.ndarray] = []
+        resonance_masses: list[float] = []
         for i in range(len(records)):
             for j in range(i + 1, len(records)):
                 ra, rb = records[i], records[j]
@@ -482,18 +473,46 @@ class GravitationalSampler:
                 if score < self.resonance_threshold:
                     continue
                 midpoint = (ra.centroid + rb.centroid) / 2.0
-                joint_mass = float(np.sqrt(ra.mass * rb.mass)) * score
-                mid_norm = midpoint / (np.linalg.norm(midpoint) + 1e-8)
-                cos_sims = embs_norm @ mid_norm
-                r = np.maximum(1.0 - cos_sims, 0.1)  # r_min=0.1, matching universe
-                force_magnitudes += self.G * token_mass * joint_mass / (r ** 2)
-                n_resonance_pairs += 1
+                resonance_centroids.append(midpoint)
+                resonance_masses.append(float(np.sqrt(ra.mass * rb.mass)) * score)
 
-        # Normalize by total number of local gravity sources so the combined
-        # local field scales like the universe field (per-body average, not sum).
+        n_local_bodies = len(groups)
+        n_resonance_pairs = len(resonance_centroids)
         n_local_sources = n_local_bodies + n_resonance_pairs
-        if n_local_sources > 0:
-            force_magnitudes /= n_local_sources
+
+        if n_local_sources > 0 and self._cached_token_embs_norm_torch is not None:
+            device = self._cached_token_embs_norm_torch.device
+            dtype = self._cached_token_embs_norm_torch.dtype
+
+            # Stack all centroid vectors: [n_local_sources, D]
+            all_centroids_np = np.stack(
+                [c for c, _ in groups] + resonance_centroids, axis=0
+            )
+            all_masses_np = np.array(
+                [m for _, m in groups] + resonance_masses, dtype=np.float32
+            )
+
+            with torch.no_grad():
+                centroids_t = torch.tensor(all_centroids_np, dtype=dtype, device=device)
+                # L2-normalize each centroid row
+                centroids_norm_t = centroids_t / (
+                    torch.norm(centroids_t, dim=1, keepdim=True) + 1e-8
+                )                                                     # [n_src, D]
+                masses_t = torch.tensor(all_masses_np, dtype=dtype, device=device)
+
+                # [vocab, n_src] cosine similarities via batched matmul
+                cos_sims_t = self._cached_token_embs_norm_torch @ centroids_norm_t.T
+                r_t = torch.clamp(1.0 - cos_sims_t, min=0.1)         # [vocab, n_src]
+                forces_t = (
+                    self.G * token_mass * masses_t / (r_t ** 2)
+                )                                                     # [vocab, n_src]
+                force_magnitudes_t = forces_t.sum(dim=1) / n_local_sources  # [vocab]
+
+        # Convert to numpy for the escape-rate check and downstream ops.
+        if force_magnitudes_t is not None:
+            force_magnitudes = force_magnitudes_t.cpu().numpy()
+        else:
+            force_magnitudes = np.zeros(vocab_size)
 
         # Escape rate: fraction of tokens with negligible context body influence.
         # Measured HERE, from context body field only, before the universe field
