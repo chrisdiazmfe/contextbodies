@@ -1,1 +1,31 @@
 whitepaper_notes.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated data
+*.npz
+qdrant_storage/
+
+# IDE
+.vscode/
+.idea/

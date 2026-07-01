@@ -35,7 +35,8 @@ store = ContextBodyStore(embedding_dim=768)
 
 sampler = GravitationalSampler(
     body_store=store,
-    G=1.0,                  # gravitational constant — primary tuning knob
+    G=1.0,                  # local context body gravitational constant
+    G_universe=1.0,         # universe field gravitational constant (always static)
     escape_threshold=0.01,  # minimum force to influence sampling
 )
 
@@ -70,8 +71,16 @@ python benchmark.py --temperature-only --temperature 0.8 --output results/temp-b
 
 ### Gravitational with local context bodies (DBSCAN)
 
+Fixed G:
+
 ```bash
-python benchmark.py --local-bodies --G-base 1.0 --adaptive-g --output results/local-bodies
+python benchmark.py --local-bodies --G-local 1.0 --output results/local-bodies
+```
+
+With AdaptiveG (`--G-local` and `--adaptive-g` are mutually exclusive — use `--G-base` as the AdaptiveG anchor):
+
+```bash
+python benchmark.py --local-bodies --G-base 1.0 --adaptive-g --output results/local-bodies-adaptive
 ```
 
 ### Universe field only (no DBSCAN)
@@ -81,18 +90,27 @@ Build a universe once and reuse it:
 ```bash
 # Build and run
 python benchmark.py --build-universe --universe-clusters 256 --universe-mass idf \
-    --G-base 1.0 --adaptive-g --output results/universe-baseline
+    --G-universe 1.0 --output results/universe-baseline
 
 # Subsequent runs — load the cached universe
 python benchmark.py --universe-path results/universe-baseline/universe.npz \
-    --G-base 1.0 --adaptive-g --output results/universe-run2
+    --G-universe 1.0 --output results/universe-run2
 ```
 
 ### Universe + local context bodies
 
+Fixed G:
+
 ```bash
 python benchmark.py --universe-path results/universe-baseline/universe.npz \
-    --local-bodies --G-base 1.0 --adaptive-g --output results/universe-plus-local
+    --local-bodies --G-local 1.0 --G-universe 1.0 --output results/universe-plus-local
+```
+
+With AdaptiveG on local bodies (universe G stays static):
+
+```bash
+python benchmark.py --universe-path results/universe-baseline/universe.npz \
+    --local-bodies --G-base 1.0 --adaptive-g --G-universe 1.0 --output results/universe-plus-local-adaptive
 ```
 
 ### Deterministic sampling
@@ -113,9 +131,11 @@ python benchmark.py --universe-path results/universe-baseline/universe.npz \
 | `--runs` | `2` | Runs per prompt (averaged) |
 | `--temperature` | `0.8` | Temperature for the baseline sampler |
 | `--temperature-only` | off | Run only the temperature baseline |
-| `--G-base` | `1.0` | Base gravitational constant. With `--adaptive-g`, this is the anchor `G_base` the PI controller oscillates around — not a fixed value |
+| `--G-local` | `1.0` | Fixed gravitational constant for local context bodies. Mutually exclusive with `--adaptive-g` |
+| `--G-universe` | `1.0` | Gravitational constant for the universe background field. Always static — never adjusted by AdaptiveG |
+| `--G-base` | `1.0` | Starting G for AdaptiveG. Only relevant when `--adaptive-g` is set; ignored otherwise |
 | `--escape-threshold` | `0.01` | Minimum force magnitude to count as bound |
-| `--adaptive-g` | off | Enable AdaptiveG controller |
+| `--adaptive-g` | off | Enable AdaptiveG controller for local bodies. Mutually exclusive with `--G-local` |
 | `--escape-rate-target` | `0.7` | AdaptiveG target fraction of unbound tokens |
 | `--mass-damping` | `1.0` | How aggressively body mass growth reduces G. 1.0=full, 0.5=square-root, 0.0=off |
 | `--build-universe` | off | Build universe from model vocabulary before running |
@@ -174,6 +194,16 @@ This solves the diversity collapse problem: context-only bodies form a feedback 
 
 Any idea expressible in the model's vocabulary has a location in its universe. Novel combinations are new trajectories through the universe, not new locations.
 
+#### Context-affinity modulation
+
+The universe field is not omnidirectional. Each body's effective mass is weighted by its cosine similarity to the current **orbital position** (the recent context embedding):
+
+```
+effective_mass = body_mass × max(0, cosine_similarity(body_centroid, context_position))
+```
+
+Bodies semantically close to what is currently being generated exert full force; bodies far away contribute near zero. This makes the universe field context-sensitive — it boosts rare tokens that are relevant to the current topic, not all rare tokens everywhere.
+
 The total field is a sum of both layers:
 
 ```
@@ -212,7 +242,8 @@ Body type is not assigned manually — it emerges from cluster density and model
 
 | Parameter | Description | Default |
 |---|---|---|
-| `G` | Gravitational constant. Higher = stronger context pull, less diversity | `1.0` |
+| `G` | Gravitational constant for local context bodies. Higher = stronger context pull, less diversity | `1.0` |
+| `G_universe` | Gravitational constant for the universe background field. Always static — not adjusted by AdaptiveG | `1.0` |
 | `escape_threshold` | Minimum force magnitude to count as gravitationally bound. With IDF weighting, tracks tokens where gravity has negligible effective influence | `0.01` |
 | `stability_threshold` | Minimum stability score for an emergent body to be persisted to the store | `0.8` |
 | `resonance_threshold` | Minimum resonance score for a body pair to produce a Lagrange midpoint force | `0.3` |
@@ -267,15 +298,26 @@ Stable emergent bodies are recorded to the `ContextBodyStore` and reused across 
 - Bodies can merge (topic convergence) or fragment (topic divergence)
 - Historical bodies seed the gravitational field at the start of new conversations
 
-### Cross-session collision detection
+### Store insertion: dedup and re-emergence
 
 Before inserting a new body, the store runs a three-stage check:
 
-1. **Exact dedup** — if a body already exists within `dedup_distance`, skip insertion
-2. **Re-emergence** — if a dormant body exists within `reemergence_distance`, re-energize it with a mass-weighted boost rather than creating a duplicate
+1. **Exact dedup** — if a body already exists within `dedup_distance`, skip insertion and update its mass
+2. **Re-emergence** — if a dormant (low-mass) body exists within `reemergence_distance`, re-energize it with a mass-weighted boost rather than creating a duplicate
 3. **New record** — otherwise insert
 
 This prevents the same concept from accumulating multiple low-mass ghosts that together double the gravitational influence of a theme.
+
+### Cross-session collision detection
+
+After a local body is persisted to the store, it is checked against all records from prior sessions. If the new body's centroid falls within `collision_distance` of an existing record, they undergo an inelastic collision:
+
+- Centroids are merged by mass-weighted average
+- Masses are summed
+- Resonance links from the incoming record are transferred to the surviving record
+- The incoming record is deleted
+
+This prevents related concepts from accumulating as separate low-mass records across sessions. Over time, repeated themes converge into single, increasingly massive bodies.
 
 ---
 
@@ -431,7 +473,10 @@ Early research implementation.
 - **Domain classifier** — EMA-based inference of active domain from the token stream.
 - **Gravitational amplification** — nearby bodies merge into virtual bodies before force computation.
 - **Inelastic collisions** — bodies within `collision_distance` merge with momentum conservation.
-- **Cross-session collision detection** — three-stage dedup/re-emergence/insert prevents duplicate bodies accumulating across sessions.
+- **Context-affinity modulation** — universe body forces weighted by cosine similarity to the current orbital position, making the universe field context-sensitive rather than omnidirectional.
+- **G split** — separate `G_local` (for context bodies, adaptive or fixed) and `G_universe` (always static) with CLI mutual exclusion between `--G-local` and `--adaptive-g`.
+- **Cross-session collision detection** — newly persisted local bodies checked against prior-session store records; overlapping bodies merge via inelastic collision (mass-weighted centroid, summed mass, transferred resonance links).
+- **GPU force computation** — local body force loop ported to a single batched torch matmul; 5× speedup on GPT-2 Medium (637ms → 124ms/token).
 - **Recency weighting** — force from persisted bodies decays with `exp(-λ × elapsed)`.
 - **QdrantBackend** — production-grade persistent store.
 - **Vector-native architecture** — `ContextBodyStore` is a thin wrapper around a `VectorBackend` protocol; swap FAISS for Qdrant, Pinecone, or pgvector at construction.
@@ -440,4 +485,3 @@ Early research implementation.
 
 - `PineconeBackend`, `PgvectorBackend`
 - MAUVE and KL-divergence metrics in the benchmark harness
-- White paper — formal writeup of the methodology, physics analogy, and comparison to temperature / top-p / top-k
