@@ -474,6 +474,15 @@ class GravitationalSampler:
                 r = np.maximum(1.0 - cos_sims, 1e-6)
                 force_magnitudes += self.G * token_mass * joint_mass / (r ** 2)
 
+        # Escape rate: fraction of tokens with negligible context body influence.
+        # Measured HERE, from context body field only, before the universe field
+        # is added. The universe is permanent background — every token is always
+        # inside it. AdaptiveG should steer context gravity, not fight the
+        # universe baseline, so universe forces must not count against escape rate.
+        escape_count = int(np.sum(force_magnitudes < self.escape_threshold))
+        self._last_escape_count = escape_count
+        self._last_vocab_size = vocab_size
+
         # Universe field: batched matrix multiply over all universe bodies.
         # Uses the GPU torch path when available (same device as the model).
         # Falls back to numpy if the torch cache isn't populated yet.
@@ -494,15 +503,6 @@ class GravitationalSampler:
         # together they suppress common tokens at both ingestion and sampling.
         if self._idf_weights is not None and len(self._idf_weights) == vocab_size:
             force_magnitudes *= self._idf_weights
-
-        # Escape rate tracking.
-        # With multiplicative reweighting, weight = 1.0 + force_magnitude.
-        # A token "escapes" gravity if its amplification is negligible, i.e.
-        # force_magnitude < escape_threshold. The threshold should be calibrated
-        # in multiplicative terms: 0.1 means weight < 1.1 (< 10% amplification).
-        escape_count = int(np.sum(force_magnitudes < self.escape_threshold))
-        self._last_escape_count = escape_count
-        self._last_vocab_size = vocab_size
 
         # Multiplicative reweighting: start from the model's own distribution
         # and amplify tokens near active bodies, rather than adding a flat bias

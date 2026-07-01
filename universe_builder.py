@@ -88,7 +88,10 @@ class Universe:
         ~10× slower on large vocabularies.
         """
         cos_sims = embs_norm @ self._centroids_norm.T          # [vocab, n_bodies]
-        r = np.maximum(1.0 - cos_sims, 1e-6)
+        # r_min=0.1 prevents singularities for tokens at their home centroid.
+        # Universe bodies are semantically broad — we want soft attraction,
+        # not a 1/r² spike for tokens that exactly match a cluster centroid.
+        r = np.maximum(1.0 - cos_sims, 0.1)
         forces = G * token_mass * self.masses / (r ** 2)
         return forces.sum(axis=1) / self.n_bodies              # [vocab]
 
@@ -127,7 +130,7 @@ class Universe:
 
         with torch.no_grad():
             cos_sims = embs_norm @ self._torch_centroids.T    # [vocab, n_bodies]
-            r = torch.clamp(1.0 - cos_sims, min=1e-6)
+            r = torch.clamp(1.0 - cos_sims, min=0.1)          # same floor as numpy path
             forces = G * token_mass * self._torch_masses / (r ** 2)
             field = forces.sum(dim=1) / self.n_bodies         # [vocab]
 
