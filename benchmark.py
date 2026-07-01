@@ -506,6 +506,31 @@ def main() -> None:
         "texts":        temp_texts,
     }
 
+    embedding_dim = model.get_input_embeddings().weight.shape[1]
+
+    # -------------------------------------------------------------------
+    # Universe setup (runs before temperature-only early exit so that
+    # --build-universe --temperature-only still produces the .npz file)
+    # -------------------------------------------------------------------
+    universe: Universe | None = None
+
+    if args.universe_path:
+        print(f"Loading universe from {args.universe_path}...")
+        universe = Universe.load(args.universe_path)
+        print(f"  Loaded: {universe.n_bodies} bodies, dim={universe.centroids.shape[1]}")
+    elif args.build_universe:
+        print(f"Building universe ({args.universe_clusters} clusters, mass={args.universe_mass})...")
+        builder = UniverseBuilder()
+        universe = builder.build(
+            model=model,
+            n_clusters=args.universe_clusters,
+            mass_scheme=args.universe_mass,
+        )
+        universe_path = out_dir / "universe.npz"
+        universe.save(universe_path)
+        config["universe_path"] = str(universe_path)
+        print(f"  Universe saved to {universe_path}")
+
     # -------------------------------------------------------------------
     # Gravitational sampling (skipped with --temperature-only)
     # -------------------------------------------------------------------
@@ -526,30 +551,6 @@ def main() -> None:
     grav_times: list[float] = []
     grav_token_counts: list[int] = []
     all_step_metrics: list[dict] = []
-
-    embedding_dim = model.get_input_embeddings().weight.shape[1]
-
-    # -------------------------------------------------------------------
-    # Universe setup
-    # -------------------------------------------------------------------
-    universe: Universe | None = None
-
-    if args.universe_path:
-        print(f"Loading universe from {args.universe_path}...")
-        universe = Universe.load(args.universe_path)
-        print(f"  Loaded: {universe.n_bodies} bodies, dim={universe.centroids.shape[1]}")
-    elif args.build_universe:
-        print(f"Building universe ({args.universe_clusters} clusters, mass={args.universe_mass})...")
-        builder = UniverseBuilder()
-        universe = builder.build(
-            model=model,
-            n_clusters=args.universe_clusters,
-            mass_scheme=args.universe_mass,
-        )
-        universe_path = out_dir / "universe.npz"
-        universe.save(universe_path)
-        config["universe_path"] = str(universe_path)
-        print(f"  Universe saved to {universe_path}")
 
     adaptive_g = AdaptiveG(
         G_base=args.G_base,
