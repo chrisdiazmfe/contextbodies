@@ -73,47 +73,60 @@ class Universe:
 
     def compute_field(
         self,
-        embs_norm: np.ndarray,   # [vocab_size, D] row-normalized token embeddings
+        embs_norm: np.ndarray,        # [vocab_size, D] row-normalized token embeddings
         G: float,
         token_mass: float = 1.0,
+        context_pos: np.ndarray | None = None,  # [D] current orbital position (unnormalized)
     ) -> np.ndarray:
         """
-        Compute the total gravitational field strength from all universe bodies
-        at every token position in the vocabulary (numpy / CPU path).
+        Compute the context-modulated gravitational field from all universe bodies
+        (numpy / CPU path).
 
-        Normalized by n_bodies so the total field magnitude is comparable to
-        a handful of context bodies regardless of cluster count.
+        Each body's force is weighted by its cosine similarity to the current
+        orbital position — bodies near the current semantic context exert full
+        force; bodies far away contribute little. This makes the universe field
+        context-specific rather than a uniform rare-token booster.
 
-        Prefer compute_field_torch() when a GPU is available — this path is
-        ~10× slower on large vocabularies.
+        Prefer compute_field_torch() when a GPU is available.
         """
-        cos_sims = embs_norm @ self._centroids_norm.T          # [vocab, n_bodies]
-        # r_min=0.1 prevents singularities for tokens at their home centroid.
-        # Universe bodies are semantically broad — we want soft attraction,
-        # not a 1/r² spike for tokens that exactly match a cluster centroid.
-        r = np.maximum(1.0 - cos_sims, 0.1)
-        forces = G * token_mass * self.masses / (r ** 2)
-        return forces.sum(axis=1) / self.n_bodies              # [vocab]
+        cos_sims = embs_norm @ self._centroids_norm.T   # [vocab, n_bodies]
+        r = np.maximum(1.0 - cos_sims, 0.1)             # [vocab, n_bodies]
+
+        # Context affinity: how relevant is each universe body to the current position?
+        # Bodies semantically close to the context get affinity near 1;
+        # bodies far away get affinity near 0 (clamped; no repulsion).
+        if context_pos is not None:
+            ctx_norm = context_pos / (np.linalg.norm(context_pos) + 1e-8)  # [D]
+            affinities = self._centroids_norm @ ctx_norm   # [n_bodies]
+            affinities = np.maximum(affinities, 0.0)       # [n_bodies], non-negative
+        else:
+            affinities = np.ones(self.n_bodies, dtype=np.float32)
+
+        effective_masses = self.masses * affinities        # [n_bodies]
+        forces = G * token_mass * effective_masses / (r ** 2)  # [vocab, n_bodies]
+        return forces.sum(axis=1) / self.n_bodies          # [vocab]
 
     def compute_field_torch(
         self,
-        embs_norm: "torch.Tensor",   # [vocab_size, D] row-normalized, on device
+        embs_norm: "torch.Tensor",        # [vocab_size, D] row-normalized, on device
         G: float,
         token_mass: float = 1.0,
+        context_pos: np.ndarray | None = None,  # [D] current orbital position (unnormalized)
     ) -> np.ndarray:
         """
-        GPU-accelerated field computation using torch.
+        GPU-accelerated context-modulated field computation.
 
-        Keeps the [vocab, n_bodies] matmul on the same device as the model's
-        embedding matrix. Centroids are cached on the device after the first call.
+        Context affinity weights each universe body by its cosine similarity to
+        the current orbital position, so only semantically nearby bodies exert
+        significant force. Centroids and masses are cached on-device after the
+        first call.
 
-        Returns a CPU numpy array of shape [vocab_size] for downstream use.
+        Returns a CPU numpy array of shape [vocab_size].
         """
         device = embs_norm.device
         dtype = embs_norm.dtype
 
         # Lazily move centroids and masses to the model's device.
-        # Cached so subsequent calls pay no transfer cost.
         if (
             not hasattr(self, "_torch_centroids")
             or self._torch_device != str(device)
@@ -130,9 +143,22 @@ class Universe:
 
         with torch.no_grad():
             cos_sims = embs_norm @ self._torch_centroids.T    # [vocab, n_bodies]
-            r = torch.clamp(1.0 - cos_sims, min=0.1)          # same floor as numpy path
-            forces = G * token_mass * self._torch_masses / (r ** 2)
-            field = forces.sum(dim=1) / self.n_bodies         # [vocab]
+            r = torch.clamp(1.0 - cos_sims, min=0.1)
+
+            # Context affinity: weight each body by relevance to current position.
+            if context_pos is not None:
+                ctx_norm = context_pos / (np.linalg.norm(context_pos) + 1e-8)
+                ctx_t = torch.tensor(ctx_norm, dtype=dtype, device=device)  # [D]
+                affinities = self._torch_centroids @ ctx_t    # [n_bodies]
+                affinities = torch.clamp(affinities, min=0.0)
+            else:
+                affinities = torch.ones(
+                    self.n_bodies, dtype=dtype, device=device
+                )
+
+            effective_masses = self._torch_masses * affinities  # [n_bodies]
+            forces = G * token_mass * effective_masses / (r ** 2)
+            field = forces.sum(dim=1) / self.n_bodies
 
         return field.cpu().numpy()
 

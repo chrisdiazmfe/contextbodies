@@ -484,16 +484,25 @@ class GravitationalSampler:
         self._last_vocab_size = vocab_size
 
         # Universe field: batched matrix multiply over all universe bodies.
-        # Uses the GPU torch path when available (same device as the model).
-        # Falls back to numpy if the torch cache isn't populated yet.
+        # Context-affinity modulation: each body is weighted by its cosine
+        # similarity to the current orbital position, so the universe field
+        # reflects what's semantically nearby right now, not a fixed rare-token
+        # boost. Bodies far from the current context contribute almost nothing.
         if self.universe is not None:
+            context_pos = (
+                self.orbital_state.position
+                if self.orbital_state is not None
+                else None
+            )
             if self._cached_token_embs_norm_torch is not None:
                 force_magnitudes += self.universe.compute_field_torch(
-                    self._cached_token_embs_norm_torch, self.G, token_mass
+                    self._cached_token_embs_norm_torch, self.G, token_mass,
+                    context_pos=context_pos,
                 )
             else:
                 force_magnitudes += self.universe.compute_field(
-                    embs_norm, self.G, token_mass
+                    embs_norm, self.G, token_mass,
+                    context_pos=context_pos,
                 )
 
         # Apply IDF to the output field so common tokens (EOS, articles,
