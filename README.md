@@ -18,7 +18,7 @@ For persistent cross-session body storage, also install Qdrant:
 pip install qdrant-client
 ```
 
-`scikit-learn` is required only if you build a universe (`--build-universe`). All other features work without it.
+`scikit-learn` is only used when building a universe (`--build-universe`). All other features work without it.
 
 ---
 
@@ -71,7 +71,7 @@ python benchmark.py --temperature-only --temperature 0.8 --output results/temp-b
 ### Gravitational with local context bodies (DBSCAN)
 
 ```bash
-python benchmark.py --local-bodies --G 1.0 --adaptive-g --output results/local-bodies
+python benchmark.py --local-bodies --G-base 1.0 --adaptive-g --output results/local-bodies
 ```
 
 ### Universe field only (no DBSCAN)
@@ -81,18 +81,18 @@ Build a universe once and reuse it:
 ```bash
 # Build and run
 python benchmark.py --build-universe --universe-clusters 256 --universe-mass idf \
-    --G 1.0 --adaptive-g --output results/universe-baseline
+    --G-base 1.0 --adaptive-g --output results/universe-baseline
 
 # Subsequent runs — load the cached universe
 python benchmark.py --universe-path results/universe-baseline/universe.npz \
-    --G 1.0 --adaptive-g --output results/universe-run2
+    --G-base 1.0 --adaptive-g --output results/universe-run2
 ```
 
 ### Universe + local context bodies
 
 ```bash
 python benchmark.py --universe-path results/universe-baseline/universe.npz \
-    --local-bodies --G 1.0 --adaptive-g --output results/universe-plus-local
+    --local-bodies --G-base 1.0 --adaptive-g --output results/universe-plus-local
 ```
 
 ### Deterministic sampling
@@ -113,21 +113,21 @@ python benchmark.py --universe-path results/universe-baseline/universe.npz \
 | `--runs` | `2` | Runs per prompt (averaged) |
 | `--temperature` | `0.8` | Temperature for the baseline sampler |
 | `--temperature-only` | off | Run only the temperature baseline |
-| `--G` | `1.0` | Gravitational constant |
+| `--G-base` | `1.0` | Base gravitational constant. With `--adaptive-g`, this is the anchor `G_base` the PI controller oscillates around — not a fixed value |
 | `--escape-threshold` | `0.01` | Minimum force magnitude to count as bound |
 | `--adaptive-g` | off | Enable AdaptiveG controller |
 | `--escape-rate-target` | `0.7` | AdaptiveG target fraction of unbound tokens |
-| `--mass-norm-strength` | `1.0` | AdaptiveG mass normalization strength |
+| `--mass-damping` | `1.0` | How aggressively body mass growth reduces G. 1.0=full, 0.5=square-root, 0.0=off |
 | `--build-universe` | off | Build universe from model vocabulary before running |
 | `--universe-path` | — | Load a pre-built universe `.npz` file |
 | `--universe-clusters` | `256` | Number of k-means clusters for universe building |
 | `--universe-mass` | `idf` | Universe body mass scheme: `uniform`, `size`, or `idf` |
-| `--local-bodies` | off | Enable DBSCAN context body layer (prompt-specific gravity) |
+| `--local-bodies` | off | Enable local context body layer (prompt-specific gravity via clustering) |
 | `--deterministic` | off | Use argmax instead of multinomial sampling |
-| `--dbscan-eps` | `0.3` | DBSCAN cluster radius (ignored with `--adaptive-dbscan`) |
-| `--dbscan-min-samples` | `3` | Minimum tokens to form a cluster core |
+| `--cluster-radius` | `0.3` | Cosine distance radius for context body clustering (ignored with `--adaptive-clustering`) |
+| `--cluster-min-tokens` | `3` | Minimum tokens required to form a context body cluster core |
 | `--no-idf` | off | Disable IDF weighting |
-| `--recency-lambda` | `0.0` | Recency decay rate (0 = disabled) |
+| `--recency-decay` | `0.0` | Rate at which persisted body force fades over time (0 = off) |
 | `--output` | `benchmark_results` | Output directory |
 
 Outputs saved to `<output>/`: `results.json`, `steps.json`, `summary.txt`, and (if built) `universe.npz`.
@@ -216,9 +216,9 @@ Body type is not assigned manually — it emerges from cluster density and model
 | `escape_threshold` | Minimum force magnitude to count as gravitationally bound. With IDF weighting, tracks tokens where gravity has negligible effective influence | `0.01` |
 | `stability_threshold` | Minimum stability score for an emergent body to be persisted to the store | `0.8` |
 | `resonance_threshold` | Minimum resonance score for a body pair to produce a Lagrange midpoint force | `0.3` |
-| `amplification_threshold` | Cosine distance below which nearby bodies merge into a virtual body before force computation | `0.2` |
+| `body_merge_distance` | Cosine distance below which nearby bodies merge into a virtual body before force computation | `0.2` |
 | `collision_distance` | Cosine distance below which two in-session bodies undergo an inelastic collision | `0.1` |
-| `recency_decay_lambda` | Time-decay rate λ for persisted body force: `exp(-λ × elapsed_seconds)`. `0.0` = disabled. `1e-4` ≈ 2-hour half-life | `0.0` |
+| `recency_decay_lambda` | Rate at which persisted body force fades over time: `exp(-rate × elapsed_seconds)`. `0.0` = disabled. `1e-4` ≈ 2-hour half-life | `0.0` |
 | `universe` | Optional `Universe` instance. Provides background gravitational field from vocabulary clustering | `None` |
 | `use_context_bodies` | Whether to run DBSCAN clustering on the prompt and generated tokens | `True` |
 | `deterministic` | Use `argmax` instead of `multinomial`. Requires a universe | `False` |
@@ -357,7 +357,7 @@ contextbodies/
 ├── domain_classifier.py     # DomainClassifier — infers domain from token stream
 ├── orbital_state.py         # Position/velocity/acceleration of the context vector
 ├── incremental_dbscan.py    # Online clustering — discovers emergent bodies token by token
-├── adaptive_dbscan.py       # AdaptiveDBSCAN — auto-calibrates eps from embedding geometry
+├── adaptive_dbscan.py       # AdaptiveDBSCAN — auto-calibrates cluster radius from embedding geometry
 ├── adaptive_g.py            # AdaptiveG — mass-normalized PI controller for G
 ├── universe_builder.py      # Universe + UniverseBuilder — vocabulary-wide semantic field
 ├── gravitational_sampler.py # Core sampler — replaces temperature at inference time

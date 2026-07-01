@@ -159,14 +159,14 @@ class TestGroupActiveBodies:
         assert sampler._group_active_bodies() == []
 
     def test_single_body_returns_one_group(self):
-        sampler = make_sampler(amplification_threshold=0.2)
+        sampler = make_sampler(body_merge_distance=0.2)
         body = make_body(axis_vec(0).astype(float), mass=3.0)
         sampler.active_bodies = [(0, body, 0.1)]
         groups = sampler._group_active_bodies()
         assert len(groups) == 1
 
     def test_close_bodies_merged_into_one_group(self):
-        sampler = make_sampler(amplification_threshold=0.3)
+        sampler = make_sampler(body_merge_distance=0.3)
         # Two bodies very close (along same axis)
         b1 = make_body(norm(axis_vec(0) + axis_vec(1) * 0.01).astype(float), mass=2.0)
         b2 = make_body(norm(axis_vec(0) + axis_vec(1) * 0.02).astype(float), mass=3.0)
@@ -175,7 +175,7 @@ class TestGroupActiveBodies:
         assert len(groups) == 1
 
     def test_close_bodies_merged_mass_is_sum(self):
-        sampler = make_sampler(amplification_threshold=0.5)
+        sampler = make_sampler(body_merge_distance=0.5)
         b1 = make_body(norm(axis_vec(0) + axis_vec(1) * 0.01).astype(float), mass=2.0)
         b2 = make_body(norm(axis_vec(0) + axis_vec(1) * 0.02).astype(float), mass=3.0)
         sampler.active_bodies = [(0, b1, 0.1), (1, b2, 0.1)]
@@ -184,7 +184,7 @@ class TestGroupActiveBodies:
         assert total_mass == pytest.approx(5.0, rel=0.05)
 
     def test_far_bodies_stay_separate(self):
-        sampler = make_sampler(amplification_threshold=0.1)
+        sampler = make_sampler(body_merge_distance=0.1)
         # Orthogonal axes -> cosine dist = 1.0 >> threshold
         b1 = make_body(axis_vec(0).astype(float), mass=1.0)
         b2 = make_body(axis_vec(1).astype(float), mass=1.0)
@@ -193,7 +193,7 @@ class TestGroupActiveBodies:
         assert len(groups) == 2
 
     def test_recency_reduces_effective_mass_in_group(self):
-        sampler = make_sampler(amplification_threshold=0.5, recency_decay_lambda=1e-3)
+        sampler = make_sampler(body_merge_distance=0.5, recency_decay_lambda=1e-3)
         # ContextBodyRecord with very old last_seen -> low recency factor
         rec = make_record(
             norm(axis_vec(0) + axis_vec(1) * 0.01).astype(float),

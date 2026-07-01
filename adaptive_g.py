@@ -98,7 +98,7 @@ class AdaptiveG:
         Ki: float = 0.01,
         feedback_window: int = 20,
         mass_ema_alpha: float = 0.05,
-        mass_norm_strength: float = 1.0,
+        mass_damping: float = 1.0,
         G_min: float = 0.01,
         G_max: float = 10.0,
         domain_multipliers: dict[str, float] | None = None,
@@ -109,7 +109,7 @@ class AdaptiveG:
         self.Ki = Ki
         self.feedback_window = feedback_window
         self.mass_ema_alpha = mass_ema_alpha
-        self.mass_norm_strength = mass_norm_strength
+        self.mass_damping = mass_damping
         self.G_min = G_min
         self.G_max = G_max
         self.domain_multipliers: dict[str, float] = domain_multipliers or {}
@@ -168,7 +168,7 @@ class AdaptiveG:
         if self._ema_body_mass is None or self._mass_ref is None:
             return 1.0
         raw_norm = self._mass_ref / (self._ema_body_mass + 1e-8)
-        return float(raw_norm ** self.mass_norm_strength)
+        return float(raw_norm ** self.mass_damping)
 
     @property
     def feedback_multiplier(self) -> float:
@@ -226,7 +226,7 @@ class AdaptiveG:
         )
 
         raw_norm = self._mass_ref / (self._ema_body_mass + 1e-8)
-        return float(raw_norm ** self.mass_norm_strength)
+        return float(raw_norm ** self.mass_damping)
 
     # ------------------------------------------------------------------
     # Internal: escape rate feedback

@@ -52,7 +52,7 @@ class GravitationalSampler:
         escape_threshold: float = 0.01,
         stability_threshold: float = 0.8,
         resonance_threshold: float = 0.3,
-        amplification_threshold: float = 0.2,
+        body_merge_distance: float = 0.2,
         collision_distance: float = 0.1,
         recency_decay_lambda: float = 0.0,
         adaptive_g: AdaptiveG | None = None,
@@ -63,15 +63,15 @@ class GravitationalSampler:
         domain: str = "",
         domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        dbscan_eps: float = 0.3,
-        dbscan_min_samples: int = 3,
+        cluster_radius: float = 0.3,
+        cluster_min_tokens: int = 3,
     ):
         self.body_store = body_store
         self.G = G
         self.escape_threshold = escape_threshold
         self.stability_threshold = stability_threshold
         self.resonance_threshold = resonance_threshold
-        self.amplification_threshold = amplification_threshold
+        self.body_merge_distance = body_merge_distance
         self.collision_distance = collision_distance
         self.recency_decay_lambda = recency_decay_lambda
         self.adaptive_g = adaptive_g
@@ -96,8 +96,8 @@ class GravitationalSampler:
         # escape rate tracking
         self._last_escape_count: int = 0
         self._last_vocab_size: int = 0
-        self.dbscan_eps = dbscan_eps
-        self.dbscan_min_samples = dbscan_min_samples
+        self.cluster_radius = cluster_radius
+        self.cluster_min_tokens = cluster_min_tokens
 
         # Cached numpy copies of the vocab embedding matrix and its L2-normalized form.
         # Populated on first sample() call; avoids a ~154MB GPU→CPU copy every step
@@ -168,8 +168,8 @@ class GravitationalSampler:
                 eps = self.adaptive_dbscan.initialize_eps(embs_np)
                 min_samples = self.adaptive_dbscan.min_samples
             else:
-                eps = self.dbscan_eps
-                min_samples = self.dbscan_min_samples
+                eps = self.cluster_radius
+                min_samples = self.cluster_min_tokens
 
             self.clustering = IncrementalDBSCAN(
                 eps=eps,
@@ -275,7 +275,7 @@ class GravitationalSampler:
         """
         Group nearby active bodies into virtual bodies for amplified force.
 
-        Bodies within amplification_threshold cosine distance of each other
+        Bodies within body_merge_distance cosine distance of each other
         are merged into a single virtual body with summed mass (weighted by
         recency factor). Returns list of (centroid, effective_mass) pairs.
         """
@@ -303,7 +303,7 @@ class GravitationalSampler:
                 ci = body_i.centroid / (np.linalg.norm(body_i.centroid) + 1e-8)
                 cj = body_j.centroid / (np.linalg.norm(body_j.centroid) + 1e-8)
                 dist = float(1.0 - np.dot(ci, cj))
-                if dist < self.amplification_threshold:
+                if dist < self.body_merge_distance:
                     used[j] = True
                     group_mass += body_j.mass * factor_j
                     # mass-weighted centroid update

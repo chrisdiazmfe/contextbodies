@@ -252,9 +252,9 @@ def print_summary(results: dict) -> None:
         print(f"  adaptive_g     : {cfg['adaptive_g']}")
         if cfg.get("escape_rate_target") is not None:
             print(f"  escape_rate_tgt: {cfg['escape_rate_target']}")
-        if cfg.get("mass_norm_strength") is not None:
-            print(f"  mass_norm_str  : {cfg['mass_norm_strength']}")
-        if cfg.get("adaptive_dbscan"):
+        if cfg.get("mass_damping") is not None:
+            print(f"  mass_damping   : {cfg['mass_damping']}")
+        if cfg.get("adaptive_clustering"):
             print(f"  target_bodies  : {cfg['target_bodies']}")
             print(f"  eps_percentile : {cfg['eps_percentile']}")
             print(f"  eps_adj_rate   : {cfg['eps_adjustment_rate']}")
@@ -325,8 +325,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature-only", action="store_true",
                    help="Run only the temperature baseline, skip gravitational sampling. "
                         "Use to sweep temperature values for a matched-perplexity comparison.")
-    p.add_argument("--G", type=float, default=1.0,
-                   help="Gravitational constant (default: 1.0)")
+    p.add_argument("--G-base", type=float, default=1.0, dest="G_base",
+                   help="Base gravitational constant (default: 1.0). When --adaptive-g is "
+                        "enabled this is G_base — the anchor the PI controller oscillates "
+                        "around. A higher G_base with the same escape_rate_target will "
+                        "settle at a higher G_eff. When --adaptive-g is off, this is the "
+                        "fixed G used throughout generation.")
     p.add_argument("--escape-threshold", type=float, default=0.01,
                    help="Escape threshold (default: 0.01). A token escapes gravity if "
                         "its IDF-weighted force magnitude is below this value. Because "
@@ -338,23 +342,24 @@ def parse_args() -> argparse.Namespace:
                    help="AdaptiveG target escape rate (default: 0.7). Lower values "
                         "allow gravity to influence more tokens; 0.15-0.20 works "
                         "well with multiplicative reweighting.")
-    p.add_argument("--mass-norm-strength", type=float, default=1.0,
-                   help="AdaptiveG mass normalization strength (default: 1.0). "
-                        "1.0=full inverse normalization, 0.5=square-root dampening, "
-                        "0.0=disabled. Reduce when using multiplicative reweighting "
-                        "since large body mass is less dangerous than with additive bias.")
-    p.add_argument("--recency-lambda", type=float, default=0.0,
-                   help="Recency decay lambda (default: 0.0 = disabled)")
+    p.add_argument("--mass-damping", type=float, default=1.0, dest="mass_damping",
+                   help="How aggressively body mass growth reduces G (default: 1.0). "
+                        "1.0=full inverse scaling, 0.5=square-root dampening, "
+                        "0.0=disabled. Keeps force magnitudes stable as bodies accumulate "
+                        "mass over a long generation.")
+    p.add_argument("--recency-decay", type=float, default=0.0, dest="recency_decay",
+                   help="Rate at which persisted body force fades over time (default: 0.0 = off). "
+                        "1e-4 ≈ 2-hour half-life; 1e-5 ≈ 19-hour half-life.")
     p.add_argument("--no-idf", action="store_true",
                    help="Disable IDF mass normalization (use raw token_mass for all tokens)")
-    p.add_argument("--dbscan-eps", type=float, default=0.3,
-                   help="DBSCAN epsilon: cosine distance radius for cluster membership (default: 0.3). "
-                        "Ignored when --adaptive-dbscan is set.")
-    p.add_argument("--dbscan-min-samples", type=int, default=3,
-                   help="DBSCAN min_samples: tokens needed to form a cluster core (default: 3)")
-    p.add_argument("--adaptive-dbscan", action="store_true",
-                   help="Enable AdaptiveDBSCAN: derives eps from prompt embedding geometry "
-                        "and adjusts it toward --target-bodies during generation.")
+    p.add_argument("--cluster-radius", type=float, default=0.3, dest="cluster_radius",
+                   help="Cosine distance radius for local context body clustering (default: 0.3). "
+                        "Smaller = tighter clusters. Ignored when --adaptive-clustering is set.")
+    p.add_argument("--cluster-min-tokens", type=int, default=3, dest="cluster_min_tokens",
+                   help="Minimum tokens required to form a context body cluster core (default: 3)")
+    p.add_argument("--adaptive-clustering", action="store_true", dest="adaptive_clustering",
+                   help="Auto-calibrate cluster radius from prompt embedding geometry "
+                        "and adjust toward --target-bodies during generation.")
     p.add_argument("--target-bodies", type=int, default=3,
                    help="AdaptiveDBSCAN target number of simultaneously active bodies (default: 3).")
     p.add_argument("--eps-percentile", type=float, default=20.0,
@@ -417,8 +422,8 @@ def main() -> None:
         prompts = DEFAULT_PROMPTS
 
     print(f"Prompts: {len(prompts)}  |  max_tokens: {args.max_tokens}  |  runs: {args.runs}")
-    print(f"G={args.G}  temperature={args.temperature}  adaptive_g={args.adaptive_g}")
-    print(f"dbscan_eps={args.dbscan_eps}  dbscan_min_samples={args.dbscan_min_samples}\n")
+    print(f"G={args.G_base}  temperature={args.temperature}  adaptive_g={args.adaptive_g}")
+    print(f"cluster_radius={args.cluster_radius}  cluster_min_tokens={args.cluster_min_tokens}\n")
 
     # Output dir
     out_dir = Path(args.output)
@@ -431,14 +436,14 @@ def main() -> None:
         "max_tokens":          args.max_tokens,
         "runs":                args.runs,
         "temperature":         args.temperature,
-        "G":                   args.G,
+        "G":                   args.G_base,
         "adaptive_g":          args.adaptive_g,
         "escape_rate_target":  args.escape_rate_target if args.adaptive_g else None,
-        "mass_norm_strength":  args.mass_norm_strength if args.adaptive_g else None,
-        "adaptive_dbscan":     args.adaptive_dbscan,
-        "target_bodies":       args.target_bodies if args.adaptive_dbscan else None,
-        "eps_percentile":      args.eps_percentile if args.adaptive_dbscan else None,
-        "eps_adjustment_rate": args.eps_adjustment_rate if args.adaptive_dbscan else None,
+        "mass_damping":        args.mass_damping if args.adaptive_g else None,
+        "adaptive_clustering": args.adaptive_clustering,
+        "target_bodies":       args.target_bodies if args.adaptive_clustering else None,
+        "eps_percentile":      args.eps_percentile if args.adaptive_clustering else None,
+        "eps_adjustment_rate": args.eps_adjustment_rate if args.adaptive_clustering else None,
         "universe_path":       args.universe_path,
         "universe_clusters":   args.universe_clusters,
         "universe_mass":       args.universe_mass,
@@ -531,17 +536,17 @@ def main() -> None:
         print(f"  Universe saved to {universe_path}")
 
     adaptive_g = AdaptiveG(
-        G_base=args.G,
+        G_base=args.G_base,
         escape_rate_target=args.escape_rate_target,
-        mass_norm_strength=args.mass_norm_strength,
+        mass_damping=args.mass_damping,
     ) if args.adaptive_g else None
 
     adaptive_dbscan = AdaptiveDBSCAN(
         target_bodies=args.target_bodies,
         eps_percentile=args.eps_percentile,
-        min_samples=args.dbscan_min_samples,
+        min_samples=args.cluster_min_tokens,
         adjustment_rate=args.eps_adjustment_rate,
-    ) if args.adaptive_dbscan else None
+    ) if args.adaptive_clustering else None
 
     # Precompute IDF weights once from the model's unconditional distribution.
     # Shared across all sampler instances — only depends on the model, not the prompt.
@@ -564,17 +569,17 @@ def main() -> None:
             store = ContextBodyStore(embedding_dim=embedding_dim, decay_interval=9999)
             sampler = GravitationalSampler(
                 body_store=store,
-                G=args.G,
+                G=args.G_base,
                 escape_threshold=args.escape_threshold,
-                recency_decay_lambda=args.recency_lambda,
+                recency_decay_lambda=args.recency_decay,
                 adaptive_g=adaptive_g,
                 adaptive_dbscan=adaptive_dbscan,
                 universe=universe,
                 use_context_bodies=args.local_bodies,
                 deterministic=args.deterministic,
                 device=device,
-                dbscan_eps=args.dbscan_eps,
-                dbscan_min_samples=args.dbscan_min_samples,
+                cluster_radius=args.cluster_radius,
+                cluster_min_tokens=args.cluster_min_tokens,
             )
             sampler._idf_weights = idf_weights  # None if --no-idf
 
