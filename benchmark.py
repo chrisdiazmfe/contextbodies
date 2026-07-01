@@ -248,7 +248,12 @@ def print_summary(results: dict) -> None:
     print(f"  runs per prompt: {cfg['runs']}")
     print(f"  temperature    : {cfg['temperature']}")
     if grav is not None:
-        print(f"  G              : {cfg['G']}")
+        if cfg.get("adaptive_g"):
+            print(f"  G_local        : adaptive")
+            print(f"  G_base         : {cfg.get('G_base', 1.0)}")
+        else:
+            print(f"  G_local        : {cfg['G_local']}")
+        print(f"  G_universe     : {cfg['G_universe']}")
         print(f"  adaptive_g     : {cfg['adaptive_g']}")
         if cfg.get("escape_rate_target") is not None:
             print(f"  escape_rate_tgt: {cfg['escape_rate_target']}")
@@ -325,19 +330,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature-only", action="store_true",
                    help="Run only the temperature baseline, skip gravitational sampling. "
                         "Use to sweep temperature values for a matched-perplexity comparison.")
+    # G_local and --adaptive-g are mutually exclusive: you either fix local
+    # body G with --G-local, or let AdaptiveG manage it automatically.
+    g_group = p.add_mutually_exclusive_group()
+    g_group.add_argument("--G-local", type=float, default=None, dest="G_local",
+                   help="Fixed gravitational constant for local context bodies (default: 1.0). "
+                        "Mutually exclusive with --adaptive-g.")
+    g_group.add_argument("--adaptive-g", action="store_true",
+                   help="Let AdaptiveG automatically tune local body G to hit the escape-rate "
+                        "target. Mutually exclusive with --G-local.")
     p.add_argument("--G-base", type=float, default=1.0, dest="G_base",
-                   help="Base gravitational constant (default: 1.0). When --adaptive-g is "
-                        "enabled this is G_base — the anchor the PI controller oscillates "
-                        "around. A higher G_base with the same escape_rate_target will "
-                        "settle at a higher G_eff. When --adaptive-g is off, this is the "
-                        "fixed G used throughout generation.")
+                   help="Starting G for AdaptiveG (default: 1.0). Only used with --adaptive-g. "
+                        "Ignored when --G-local is set.")
+    p.add_argument("--G-universe", type=float, default=1.0, dest="G_universe",
+                   help="Gravitational constant for the universe background field (default: 1.0). "
+                        "Independent of --G-local / --adaptive-g. Tune this to control the "
+                        "background diversity boost without interfering with AdaptiveG.")
     p.add_argument("--escape-threshold", type=float, default=0.01,
                    help="Escape threshold (default: 0.01). A token escapes gravity if "
                         "its IDF-weighted force magnitude is below this value. Because "
                         "IDF suppresses common tokens toward zero, this correctly "
                         "captures tokens where gravity has negligible effective influence.")
-    p.add_argument("--adaptive-g", action="store_true",
-                   help="Enable AdaptiveG controller")
     p.add_argument("--escape-rate-target", type=float, default=0.7,
                    help="AdaptiveG target escape rate (default: 0.7). Lower values "
                         "allow gravity to influence more tokens; 0.15-0.20 works "
@@ -422,7 +435,8 @@ def main() -> None:
         prompts = DEFAULT_PROMPTS
 
     print(f"Prompts: {len(prompts)}  |  max_tokens: {args.max_tokens}  |  runs: {args.runs}")
-    print(f"G={args.G_base}  temperature={args.temperature}  adaptive_g={args.adaptive_g}")
+    G_local = args.G_local if args.G_local is not None else args.G_base
+    print(f"G_local={G_local}  G_universe={args.G_universe}  temperature={args.temperature}  adaptive_g={args.adaptive_g}")
     print(f"cluster_radius={args.cluster_radius}  cluster_min_tokens={args.cluster_min_tokens}\n")
 
     # Output dir
@@ -436,7 +450,9 @@ def main() -> None:
         "max_tokens":          args.max_tokens,
         "runs":                args.runs,
         "temperature":         args.temperature,
-        "G":                   args.G_base,
+        "G_local":             G_local,
+        "G_universe":          args.G_universe,
+        "G_base":              args.G_base if args.adaptive_g else None,
         "adaptive_g":          args.adaptive_g,
         "escape_rate_target":  args.escape_rate_target if args.adaptive_g else None,
         "mass_damping":        args.mass_damping if args.adaptive_g else None,
@@ -540,6 +556,7 @@ def main() -> None:
         escape_rate_target=args.escape_rate_target,
         mass_damping=args.mass_damping,
     ) if args.adaptive_g else None
+    # G_local is fixed when --adaptive-g is not set
 
     adaptive_dbscan = AdaptiveDBSCAN(
         target_bodies=args.target_bodies,
@@ -569,7 +586,8 @@ def main() -> None:
             store = ContextBodyStore(embedding_dim=embedding_dim, decay_interval=9999)
             sampler = GravitationalSampler(
                 body_store=store,
-                G=args.G_base,
+                G=G_local,
+                G_universe=args.G_universe,
                 escape_threshold=args.escape_threshold,
                 recency_decay_lambda=args.recency_decay,
                 adaptive_g=adaptive_g,

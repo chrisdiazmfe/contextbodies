@@ -49,6 +49,7 @@ class GravitationalSampler:
         self,
         body_store: ContextBodyStore,
         G: float = 1.0,
+        G_universe: float = 1.0,
         escape_threshold: float = 0.01,
         stability_threshold: float = 0.8,
         resonance_threshold: float = 0.3,
@@ -68,6 +69,7 @@ class GravitationalSampler:
     ):
         self.body_store = body_store
         self.G = G
+        self.G_universe = G_universe
         self.escape_threshold = escape_threshold
         self.stability_threshold = stability_threshold
         self.resonance_threshold = resonance_threshold
@@ -496,12 +498,12 @@ class GravitationalSampler:
             )
             if self._cached_token_embs_norm_torch is not None:
                 force_magnitudes += self.universe.compute_field_torch(
-                    self._cached_token_embs_norm_torch, self.G, token_mass,
+                    self._cached_token_embs_norm_torch, self.G_universe, token_mass,
                     context_pos=context_pos,
                 )
             else:
                 force_magnitudes += self.universe.compute_field(
-                    embs_norm, self.G, token_mass,
+                    embs_norm, self.G_universe, token_mass,
                     context_pos=context_pos,
                 )
 
