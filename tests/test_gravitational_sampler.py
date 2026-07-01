@@ -307,101 +307,108 @@ class TestCheckCollisions:
 # ---------------------------------------------------------------------------
 
 class TestCrossSessionCollisions:
+    """
+    Setup convention: insert records directly via store.backend.upsert() rather
+    than store.record(), to bypass dedup and reemergence logic that would
+    interfere with controlled collision scenarios.
+
+    Centroid pairs are chosen so cosine_distance > dedup_distance (0.05) but
+    < collision_distance (0.5), i.e. axis_vec(0) vs norm(axis_vec(0)+axis_vec(1))
+    gives distance ≈ 0.29.
+    """
+
+    def _insert_record(self, store, rec):
+        """Directly insert a ContextBodyRecord, bypassing store.record() dedup."""
+        store.backend.upsert(str(rec.id), rec.centroid, rec.to_metadata())
+        store._record_mass[str(rec.id)] = rec.mass
+        store._record_last_seen[str(rec.id)] = rec.last_seen
 
     def test_no_collision_when_far(self):
-        """Local body far from store record → no merge."""
+        """Local body orthogonal to store record → no merge."""
         store = make_store()
         sampler = GravitationalSampler(body_store=store, G=1.0, collision_distance=0.1)
 
+        # axis_vec(0) vs axis_vec(1): cosine distance = 1.0 > collision_distance
         local_body = make_body(axis_vec(0).astype(float), mass=1.0)
-        store_rec = make_record(axis_vec(1).astype(float), mass=2.0)  # orthogonal
-        store.backend.upsert(str(store_rec.id), store_rec.centroid, store_rec.to_metadata())
-        store._record_mass[str(store_rec.id)] = store_rec.mass
+        store_rec = make_record(axis_vec(1).astype(float), mass=2.0)
+        self._insert_record(store, store_rec)
 
-        sampler.active_bodies = [(0, local_body, 0.0), (-1, store_rec, 0.5)]
-        sampler._label_record_ids = {0: "local-id-placeholder"}
+        local_rec = make_record(axis_vec(0).astype(float), mass=1.0)
+        self._insert_record(store, local_rec)
 
-        # Register the local body in the store so merge_records has something to delete
-        rec_id = store.record(centroid=local_body.centroid, mass=local_body.mass,
-                              stability=1.0, domain="")
-        sampler._label_record_ids = {0: str(rec_id)}
+        sampler.active_bodies = [(0, local_body, 0.0), (-1, store_rec, 1.0)]
+        sampler._label_record_ids = {0: str(local_rec.id)}
 
         sampler._check_cross_session_collisions()
 
-        # Both records should still exist
         assert str(store_rec.id) in store._record_mass
-        assert str(rec_id) in store._record_mass
+        assert str(local_rec.id) in store._record_mass
 
     def test_collision_absorbs_incoming(self):
-        """Local body near store record → incoming absorbed, only store record survives."""
+        """Local body within collision_distance of store record → incoming absorbed."""
         store = make_store()
         sampler = GravitationalSampler(body_store=store, G=1.0, collision_distance=0.5)
 
-        # Nearly identical centroids → cosine distance ≈ 0 < collision_distance
-        c = axis_vec(0).astype(float)
-        local_body = make_body(c.copy(), mass=1.0)
-        store_rec = make_record(c.copy(), mass=2.0)
-        store.backend.upsert(str(store_rec.id), store_rec.centroid, store_rec.to_metadata())
-        store._record_mass[str(store_rec.id)] = store_rec.mass
+        # distance ≈ 0.29: inside collision_distance, outside dedup_distance
+        c_local = axis_vec(0).astype(float)
+        c_store = norm(axis_vec(0) + axis_vec(1)).astype(float)
 
-        # Persist the local body as a separate record first
-        rec_id = store.record(centroid=local_body.centroid + 1e-4, mass=local_body.mass,
-                              stability=1.0, domain="")
-        local_id = str(rec_id)
+        local_body = make_body(c_local, mass=1.0)
+        local_rec = make_record(c_local, mass=1.0)
+        store_rec = make_record(c_store, mass=2.0)
+        self._insert_record(store, local_rec)
+        self._insert_record(store, store_rec)
+
         sampler.active_bodies = [(0, local_body, 0.0), (-1, store_rec, 0.0)]
-        sampler._label_record_ids = {0: local_id}
+        sampler._label_record_ids = {0: str(local_rec.id)}
 
         sampler._check_cross_session_collisions()
 
-        # Incoming absorbed: local_id gone, store_rec survives with summed mass
-        assert local_id not in store._record_mass
+        assert str(local_rec.id) not in store._record_mass
         assert str(store_rec.id) in store._record_mass
         assert store._record_mass[str(store_rec.id)] == pytest.approx(3.0, rel=0.05)
 
     def test_label_redirected_after_collision(self):
-        """After collision, label maps to surviving store record ID."""
+        """After collision, label maps to the surviving store record ID."""
         store = make_store()
         sampler = GravitationalSampler(body_store=store, G=1.0, collision_distance=0.5)
 
-        c = axis_vec(0).astype(float)
-        local_body = make_body(c.copy(), mass=1.0)
-        store_rec = make_record(c.copy(), mass=2.0)
-        store.backend.upsert(str(store_rec.id), store_rec.centroid, store_rec.to_metadata())
-        store._record_mass[str(store_rec.id)] = store_rec.mass
+        c_local = axis_vec(0).astype(float)
+        c_store = norm(axis_vec(0) + axis_vec(1)).astype(float)
 
-        rec_id = store.record(centroid=local_body.centroid + 1e-4, mass=local_body.mass,
-                              stability=1.0, domain="")
+        local_body = make_body(c_local, mass=1.0)
+        local_rec = make_record(c_local, mass=1.0)
+        store_rec = make_record(c_store, mass=2.0)
+        self._insert_record(store, local_rec)
+        self._insert_record(store, store_rec)
+
         sampler.active_bodies = [(0, local_body, 0.0), (-1, store_rec, 0.0)]
-        sampler._label_record_ids = {0: str(rec_id)}
+        sampler._label_record_ids = {0: str(local_rec.id)}
 
         sampler._check_cross_session_collisions()
 
         assert sampler._label_record_ids[0] == str(store_rec.id)
 
-    def test_merged_centroid_is_mass_weighted(self):
-        """Merged centroid is mass-weighted average of both bodies."""
+    def test_merged_mass_is_sum(self):
+        """Surviving record gets the sum of both masses."""
         store = make_store()
         sampler = GravitationalSampler(body_store=store, G=1.0, collision_distance=0.5)
 
-        # Two nearby but distinct centroids
         c_local = axis_vec(0).astype(float)
-        c_store = (axis_vec(0) * 0.9 + axis_vec(1) * 0.1).astype(float)
+        c_store = norm(axis_vec(0) + axis_vec(1)).astype(float)
         m_local, m_store = 1.0, 3.0
-        expected = (c_local * m_local + c_store * m_store) / (m_local + m_store)
 
         local_body = make_body(c_local, mass=m_local)
+        local_rec = make_record(c_local, mass=m_local)
         store_rec = make_record(c_store, mass=m_store)
-        store.backend.upsert(str(store_rec.id), store_rec.centroid, store_rec.to_metadata())
-        store._record_mass[str(store_rec.id)] = m_store
+        self._insert_record(store, local_rec)
+        self._insert_record(store, store_rec)
 
-        rec_id = store.record(centroid=c_local, mass=m_local, stability=1.0, domain="")
         sampler.active_bodies = [(0, local_body, 0.0), (-1, store_rec, 0.0)]
-        sampler._label_record_ids = {0: str(rec_id)}
+        sampler._label_record_ids = {0: str(local_rec.id)}
 
         sampler._check_cross_session_collisions()
 
-        # Verify the surviving record was re-upserted with merged centroid
-        # by checking the mass (centroid is in the FAISS index, not directly readable)
         assert store._record_mass[str(store_rec.id)] == pytest.approx(4.0, rel=0.05)
 
 
