@@ -99,11 +99,12 @@ class GravitationalSampler:
         self.cluster_radius = cluster_radius
         self.cluster_min_tokens = cluster_min_tokens
 
-        # Cached numpy copies of the vocab embedding matrix and its L2-normalized form.
-        # Populated on first sample() call; avoids a ~154MB GPU→CPU copy every step
-        # and pre-computes the normalized matrix used in vectorized field computation.
+        # Cached embedding matrices populated on first sample() call.
+        # numpy copies avoid repeated GPU→CPU transfers for the context body field.
+        # The torch copy keeps the universe field computation on GPU.
         self._cached_token_embs_np: np.ndarray | None = None
-        self._cached_token_embs_norm: np.ndarray | None = None  # row-normalized [vocab, D]
+        self._cached_token_embs_norm: np.ndarray | None = None       # row-normalized [vocab, D], CPU numpy
+        self._cached_token_embs_norm_torch: torch.Tensor | None = None  # row-normalized [vocab, D], on device
         self._cached_token_embs_id: int = -1
 
         # IDF-style mass weights [vocab_size], computed from unconditional token
@@ -434,8 +435,12 @@ class GravitationalSampler:
             self._cached_token_embs_np = token_embeddings.detach().cpu().numpy()
             norms = np.linalg.norm(self._cached_token_embs_np, axis=1, keepdims=True)
             self._cached_token_embs_norm = self._cached_token_embs_np / (norms + 1e-8)
+            # Torch version stays on device for the universe field matmul.
+            with torch.no_grad():
+                norms_t = torch.norm(token_embeddings, dim=1, keepdim=True)
+                self._cached_token_embs_norm_torch = token_embeddings / (norms_t + 1e-8)
             self._cached_token_embs_id = emb_id
-        embs_norm = self._cached_token_embs_norm  # [vocab_size, D], row-normalized
+        embs_norm = self._cached_token_embs_norm  # [vocab_size, D], CPU numpy
 
         # Get virtual body groups
         groups = self._group_active_bodies()
@@ -470,12 +475,17 @@ class GravitationalSampler:
                 force_magnitudes += self.G * token_mass * joint_mass / (r ** 2)
 
         # Universe field: batched matrix multiply over all universe bodies.
-        # Provides the background gravitational field from pre-computed vocabulary
-        # clusters. This is separate from (and added to) the context body field.
+        # Uses the GPU torch path when available (same device as the model).
+        # Falls back to numpy if the torch cache isn't populated yet.
         if self.universe is not None:
-            force_magnitudes += self.universe.compute_field(
-                embs_norm, self.G, token_mass
-            )
+            if self._cached_token_embs_norm_torch is not None:
+                force_magnitudes += self.universe.compute_field_torch(
+                    self._cached_token_embs_norm_torch, self.G, token_mass
+                )
+            else:
+                force_magnitudes += self.universe.compute_field(
+                    embs_norm, self.G, token_mass
+                )
 
         # Apply IDF to the output field so common tokens (EOS, articles,
         # punctuation) receive reduced gravitational amplification even when
@@ -537,6 +547,24 @@ class GravitationalSampler:
             4. Boost resonance for collision-event pairs.
             5. Run inelastic collision check on active_bodies.
         """
+        # Domain classifier and AdaptiveG always run, regardless of whether
+        # local context body clustering is enabled. Both depend only on the
+        # escape rate computed during sample(), not on DBSCAN state.
+        if self.domain_classifier is not None:
+            self.domain = self.domain_classifier.update(token_embedding)
+
+        if self.adaptive_g is not None:
+            escape_rate = (
+                self._last_escape_count / (self._last_vocab_size + 1e-8)
+                if self._last_vocab_size > 0 else 0.0
+            )
+            self.G = self.adaptive_g.update(
+                active_bodies=[body for _, body, _ in self.active_bodies],
+                escape_rate=escape_rate,
+                domain=self.domain,
+            )
+
+        # Everything below requires local context body clustering.
         if self.clustering is None:
             return
 
@@ -560,10 +588,6 @@ class GravitationalSampler:
         # Remove merged-away labels from the record mapping
         for old_label, _ in merged_events:
             self._label_record_ids.pop(old_label, None)
-
-        # Update domain classifier
-        if self.domain_classifier is not None:
-            self.domain = self.domain_classifier.update(token_embedding)
 
         # Rebuild cluster portion of active_bodies from current DBSCAN state.
         # Keep store records (label=-1) in place; replace all label>=0 entries.
@@ -602,19 +626,7 @@ class GravitationalSampler:
         # Inelastic collision check within active bodies
         self._check_collisions()
 
-        # Update adaptive DBSCAN eps toward target body count
-        if self.adaptive_dbscan is not None and self.clustering is not None:
+        # Update adaptive clustering radius toward target body count
+        if self.adaptive_dbscan is not None:
             new_eps = self.adaptive_dbscan.update(len(self.active_bodies))
             self.clustering.eps = new_eps
-
-        # Update adaptive G if configured
-        if self.adaptive_g is not None:
-            escape_rate = (
-                self._last_escape_count / (self._last_vocab_size + 1e-8)
-                if self._last_vocab_size > 0 else 0.0
-            )
-            self.G = self.adaptive_g.update(
-                active_bodies=[body for _, body, _ in self.active_bodies],
-                escape_rate=escape_rate,
-                domain=self.domain,
-            )

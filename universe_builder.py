@@ -79,35 +79,59 @@ class Universe:
     ) -> np.ndarray:
         """
         Compute the total gravitational field strength from all universe bodies
-        at every token position in the vocabulary.
+        at every token position in the vocabulary (numpy / CPU path).
 
-        Uses a single batched matrix multiply rather than one loop per body:
+        Normalized by n_bodies so the total field magnitude is comparable to
+        a handful of context bodies regardless of cluster count.
 
-            cos_sims  = embs_norm @ centroids_norm.T    [vocab, n_bodies]
-            r         = 1 - cos_sims                    [vocab, n_bodies]
-            forces    = G * m_token * masses / r²       [vocab, n_bodies]
-            field     = forces.sum(axis=1)              [vocab]
-
-        Parameters
-        ----------
-        embs_norm   : L2-normalized vocabulary embedding matrix [vocab_size, D]
-        G           : gravitational constant
-        token_mass  : mass of the candidate token (default 1.0)
-
-        Returns
-        -------
-        field : [vocab_size] total gravitational field strength per token
+        Prefer compute_field_torch() when a GPU is available — this path is
+        ~10× slower on large vocabularies.
         """
-        # [vocab_size, n_bodies] cosine similarities
-        cos_sims = embs_norm @ self._centroids_norm.T
+        cos_sims = embs_norm @ self._centroids_norm.T          # [vocab, n_bodies]
+        r = np.maximum(1.0 - cos_sims, 1e-6)
+        forces = G * token_mass * self.masses / (r ** 2)
+        return forces.sum(axis=1) / self.n_bodies              # [vocab]
 
-        # cosine distance, clipped to avoid 1/0 at identical vectors
-        r = np.maximum(1.0 - cos_sims, 1e-6)          # [vocab_size, n_bodies]
+    def compute_field_torch(
+        self,
+        embs_norm: "torch.Tensor",   # [vocab_size, D] row-normalized, on device
+        G: float,
+        token_mass: float = 1.0,
+    ) -> np.ndarray:
+        """
+        GPU-accelerated field computation using torch.
 
-        # F = G * m_token * m_body / r²  for each (token, body) pair
-        forces = G * token_mass * self.masses / (r ** 2)  # [vocab_size, n_bodies]
+        Keeps the [vocab, n_bodies] matmul on the same device as the model's
+        embedding matrix. Centroids are cached on the device after the first call.
 
-        return forces.sum(axis=1)                       # [vocab_size]
+        Returns a CPU numpy array of shape [vocab_size] for downstream use.
+        """
+        device = embs_norm.device
+        dtype = embs_norm.dtype
+
+        # Lazily move centroids and masses to the model's device.
+        # Cached so subsequent calls pay no transfer cost.
+        if (
+            not hasattr(self, "_torch_centroids")
+            or self._torch_device != str(device)
+            or self._torch_dtype != str(dtype)
+        ):
+            self._torch_centroids = torch.tensor(
+                self._centroids_norm, dtype=dtype, device=device
+            )
+            self._torch_masses = torch.tensor(
+                self.masses, dtype=dtype, device=device
+            )
+            self._torch_device = str(device)
+            self._torch_dtype = str(dtype)
+
+        with torch.no_grad():
+            cos_sims = embs_norm @ self._torch_centroids.T    # [vocab, n_bodies]
+            r = torch.clamp(1.0 - cos_sims, min=1e-6)
+            forces = G * token_mass * self._torch_masses / (r ** 2)
+            field = forces.sum(dim=1) / self.n_bodies         # [vocab]
+
+        return field.cpu().numpy()
 
     # ------------------------------------------------------------------
     # Diagnostics
