@@ -7,7 +7,7 @@ import pytest
 # torch is optional for tests; skip entire module if unavailable
 torch = pytest.importorskip("torch")
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from context_body import ContextBody
@@ -50,7 +50,7 @@ def make_record(centroid, mass, last_seen=None):
     rec = ContextBodyRecord(
         centroid=centroid.copy().astype(float),
         mass=mass,
-        last_seen=last_seen or datetime.utcnow(),
+        last_seen=last_seen or datetime.now(timezone.utc),
     )
     return rec
 
@@ -128,20 +128,20 @@ class TestRecencyFactor:
     def test_lambda_zero_always_returns_one(self):
         sampler = make_sampler(recency_decay_lambda=0.0)
         rec = make_record(axis_vec(0).astype(float), mass=1.0,
-                          last_seen=datetime.utcnow() - timedelta(hours=5))
+                          last_seen=datetime.now(timezone.utc) - timedelta(hours=5))
         assert sampler._recency_factor(rec) == pytest.approx(1.0)
 
     def test_fresh_record_factor_near_one(self):
         sampler = make_sampler(recency_decay_lambda=1e-4)
         rec = make_record(axis_vec(0).astype(float), mass=1.0,
-                          last_seen=datetime.utcnow())
+                          last_seen=datetime.now(timezone.utc))
         factor = sampler._recency_factor(rec)
         assert factor == pytest.approx(1.0, abs=0.01)
 
     def test_old_record_factor_less_than_one(self):
         sampler = make_sampler(recency_decay_lambda=1e-4)
         rec = make_record(axis_vec(0).astype(float), mass=1.0,
-                          last_seen=datetime.utcnow() - timedelta(hours=1))
+                          last_seen=datetime.now(timezone.utc) - timedelta(hours=1))
         factor = sampler._recency_factor(rec)
         expected = np.exp(-1e-4 * 3600)
         assert factor == pytest.approx(expected, rel=0.05)
@@ -198,7 +198,7 @@ class TestGroupActiveBodies:
         rec = make_record(
             norm(axis_vec(0) + axis_vec(1) * 0.01).astype(float),
             mass=10.0,
-            last_seen=datetime.utcnow() - timedelta(hours=24),
+            last_seen=datetime.now(timezone.utc) - timedelta(hours=24),
         )
         sampler.active_bodies = [(-1, rec, 0.1)]
         groups = sampler._group_active_bodies()

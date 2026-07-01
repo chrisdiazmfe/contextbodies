@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import numpy as np
@@ -39,8 +39,8 @@ class ContextBodyRecord:
     mass: float = 0.0
     stability: float = 0.0
     domain: str = ""
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    last_seen: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     # resonance_partners: partner_record_id → score in [0, 1]
     # populated by ContextBodyStore.record_resonance() and persisted as JSON
@@ -79,9 +79,9 @@ class ContextBodyRecord:
             domain=str(metadata.get("domain", "")),
             created_at=datetime.fromisoformat(metadata["created_at"])
             if "created_at" in metadata
-            else datetime.utcnow(),
+            else datetime.now(timezone.utc),
             last_seen=datetime.fromisoformat(metadata["last_seen"])
             if "last_seen" in metadata
-            else datetime.utcnow(),
+            else datetime.now(timezone.utc),
             resonance_partners=resonance_partners,
         )

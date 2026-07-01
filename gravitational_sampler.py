@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import torch
@@ -269,7 +269,7 @@ class GravitationalSampler:
             return 1.0
         if self.recency_decay_lambda == 0.0:
             return 1.0
-        elapsed = (datetime.utcnow() - body.last_seen).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - body.last_seen).total_seconds()
         return float(np.exp(-self.recency_decay_lambda * elapsed))
 
     def _group_active_bodies(

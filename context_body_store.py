@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import numpy as np
@@ -87,7 +87,7 @@ class ContextBodyStore:
         if nearby and nearby[0][1] < self.dedup_distance:
             existing, _ = nearby[0]
             new_mass = (existing.mass + mass) / 2
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             self.backend.update_metadata(str(existing.id), {
                 "mass": new_mass,
                 "last_seen": now.isoformat(),
@@ -112,7 +112,7 @@ class ContextBodyStore:
             if current_mass < self.reemergence_mass_threshold:
                 alpha = mass / (current_mass + mass + 1e-8)
                 new_mass = (1.0 - alpha) * current_mass + alpha * mass
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 self.backend.update_metadata(record_id, {
                     "mass": new_mass,
                     "last_seen": now.isoformat(),
@@ -155,7 +155,7 @@ class ContextBodyStore:
         since the last automatic decay run.
         """
         # Auto-decay trigger
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if self._last_decay_at is None or (
             (now - self._last_decay_at).total_seconds() >= self.decay_interval
         ):
@@ -191,7 +191,7 @@ class ContextBodyStore:
         Returns list of extinct record UUIDs (as strings).
         """
         extinct: list[str] = []
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         for record_id in list(self._record_mass.keys()):
             last_seen = self._record_last_seen.get(record_id, now)
@@ -254,7 +254,7 @@ class ContextBodyStore:
         # Re-upsert the surviving record with the merged centroid and summed
         # mass. upsert() removes the stale FAISS vector before reinserting, so
         # the ANN index stays consistent without a separate delete step.
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         merged_meta = existing_record.to_metadata()
         merged_meta["mass"] = total_mass
         merged_meta["last_seen"] = now.isoformat()

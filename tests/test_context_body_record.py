@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import json
 import numpy as np
 import pytest
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 from context_body_record import ContextBodyRecord
 
@@ -122,8 +122,8 @@ class TestFromMetadata:
             "mass": 1.0,
             "stability": 0.5,
             "domain": "",
-            "created_at": datetime.utcnow().isoformat(),
-            "last_seen": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_seen": datetime.now(timezone.utc).isoformat(),
             # "resonance_partners" intentionally absent
         }
         restored = ContextBodyRecord.from_metadata(centroid=centroid, metadata=meta)
@@ -136,8 +136,8 @@ class TestFromMetadata:
             "mass": 1.0,
             "stability": 0.5,
             "domain": "",
-            "created_at": datetime.utcnow().isoformat(),
-            "last_seen": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_seen": datetime.now(timezone.utc).isoformat(),
             "resonance_partners": "NOT VALID JSON {{{",
         }
         restored = ContextBodyRecord.from_metadata(centroid=centroid, metadata=meta)
@@ -150,7 +150,7 @@ class TestFromMetadata:
             "mass": 1.0,
             "stability": 0.5,
             "domain": "",
-            "last_seen": datetime.utcnow().isoformat(),
+            "last_seen": datetime.now(timezone.utc).isoformat(),
             "resonance_partners": "{}",
             # "created_at" absent
         }
@@ -164,7 +164,7 @@ class TestFromMetadata:
             "mass": 1.0,
             "stability": 0.5,
             "domain": "",
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "resonance_partners": "{}",
             # "last_seen" absent
         }

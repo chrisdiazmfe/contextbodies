@@ -317,8 +317,8 @@ class TestAutoDecayTrigger:
         uid = store.record(axis_vec(0), mass=0.1, stability=0.5)
         store._record_mass[str(uid)] = 0.1
         # Manually set last_decay_at to now so interval hasn't elapsed
-        from datetime import datetime
-        store._last_decay_at = datetime.utcnow()
+        from datetime import datetime, timezone
+        store._last_decay_at = datetime.now(timezone.utc)
         store.query_nearby(axis_vec(0))
         # Record should still be present (decay not triggered)
         assert str(uid) in store._record_mass
