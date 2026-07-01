@@ -35,6 +35,7 @@ from context_body_store import ContextBodyStore
 from gravitational_sampler import GravitationalSampler
 from adaptive_g import AdaptiveG
 from adaptive_dbscan import AdaptiveDBSCAN
+from universe_builder import Universe, UniverseBuilder
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +258,11 @@ def print_summary(results: dict) -> None:
             print(f"  target_bodies  : {cfg['target_bodies']}")
             print(f"  eps_percentile : {cfg['eps_percentile']}")
             print(f"  eps_adj_rate   : {cfg['eps_adjustment_rate']}")
+        if cfg.get("universe_path"):
+            print(f"  universe       : {cfg['universe_path']}")
+            print(f"  universe_mass  : {cfg['universe_mass']}")
+        print(f"  local_bodies   : {cfg['local_bodies']}")
+        print(f"  deterministic  : {cfg['deterministic']}")
     print()
 
     if grav is None:
@@ -282,6 +288,11 @@ def print_summary(results: dict) -> None:
         row("avg length (words)", temp["avg_length"],   grav["avg_length"],  ".1f")
         row("total time (s)",     temp["total_time_s"], grav["total_time_s"], ".2f")
         row("ms / token (mean)",  temp["ms_per_token"], grav["ms_per_token"], ".1f")
+
+        if grav.get("semantic_coverage") is not None:
+            label = "semantic coverage"
+            g_val = grav["semantic_coverage"]
+            print(f"  {label:<28} {'—':>14} {g_val:>14.4f}")
 
         if grav.get("step_metrics_summary"):
             sm = grav["step_metrics_summary"]
@@ -351,6 +362,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eps-adjustment-rate", type=float, default=0.01,
                    help="How much eps changes per step when body count is off-target (default: 0.01). "
                         "Lower values = smoother but slower adaptation.")
+    # Universe
+    p.add_argument("--universe-path", default=None,
+                   help="Path to a pre-built universe .npz file. "
+                        "If omitted and --build-universe is not set, no universe is used.")
+    p.add_argument("--build-universe", action="store_true",
+                   help="Build a new universe from the model's vocabulary embeddings "
+                        "before running benchmarks. Saved to <output>/universe.npz.")
+    p.add_argument("--universe-clusters", type=int, default=256,
+                   help="Number of k-means clusters (universe bodies) to build (default: 256).")
+    p.add_argument("--universe-mass", default="idf",
+                   choices=["uniform", "size", "idf"],
+                   help="Mass scheme for universe bodies: uniform, size (cluster size), "
+                        "or idf (mean IDF weight of member tokens). Default: idf.")
+    # Context body layer
+    p.add_argument("--local-bodies", action="store_true",
+                   help="Enable the local context body layer (DBSCAN clustering of "
+                        "prompt and generated tokens). Provides prompt-specific "
+                        "gravitational perturbations on top of the universe field. "
+                        "When omitted, only the universe field is used.")
+    p.add_argument("--deterministic", action="store_true",
+                   help="Use argmax instead of multinomial sampling. "
+                        "Diversity comes entirely from universe geometry — "
+                        "same prompt always produces the same output.")
     p.add_argument("--output", default="benchmark_results",
                    help="Output directory (default: benchmark_results)")
     p.add_argument("--device", default=None,
@@ -405,6 +439,11 @@ def main() -> None:
         "target_bodies":       args.target_bodies if args.adaptive_dbscan else None,
         "eps_percentile":      args.eps_percentile if args.adaptive_dbscan else None,
         "eps_adjustment_rate": args.eps_adjustment_rate if args.adaptive_dbscan else None,
+        "universe_path":       args.universe_path,
+        "universe_clusters":   args.universe_clusters,
+        "universe_mass":       args.universe_mass,
+        "local_bodies":        args.local_bodies,
+        "deterministic":       args.deterministic,
         "device":              device,
     }
 
@@ -469,6 +508,28 @@ def main() -> None:
 
     embedding_dim = model.get_input_embeddings().weight.shape[1]
 
+    # -------------------------------------------------------------------
+    # Universe setup
+    # -------------------------------------------------------------------
+    universe: Universe | None = None
+
+    if args.universe_path:
+        print(f"Loading universe from {args.universe_path}...")
+        universe = Universe.load(args.universe_path)
+        print(f"  Loaded: {universe.n_bodies} bodies, dim={universe.centroids.shape[1]}")
+    elif args.build_universe:
+        print(f"Building universe ({args.universe_clusters} clusters, mass={args.universe_mass})...")
+        builder = UniverseBuilder()
+        universe = builder.build(
+            model=model,
+            n_clusters=args.universe_clusters,
+            mass_scheme=args.universe_mass,
+        )
+        universe_path = out_dir / "universe.npz"
+        universe.save(universe_path)
+        config["universe_path"] = str(universe_path)
+        print(f"  Universe saved to {universe_path}")
+
     adaptive_g = AdaptiveG(
         G_base=args.G,
         escape_rate_target=args.escape_rate_target,
@@ -508,6 +569,9 @@ def main() -> None:
                 recency_decay_lambda=args.recency_lambda,
                 adaptive_g=adaptive_g,
                 adaptive_dbscan=adaptive_dbscan,
+                universe=universe,
+                use_context_bodies=args.local_bodies,
+                deterministic=args.deterministic,
                 device=device,
                 dbscan_eps=args.dbscan_eps,
                 dbscan_min_samples=args.dbscan_min_samples,
@@ -549,15 +613,26 @@ def main() -> None:
         "mean_G_eff":         round(float(np.mean(G_effs)), 4) if G_effs else None,
     }
 
+    # Semantic coverage: fraction of universe bodies visited across all generated texts.
+    # Only meaningful when a universe is loaded.
+    semantic_coverage: float | None = None
+    if universe is not None:
+        coverages = []
+        for text in grav_texts:
+            token_ids = tokenizer.encode(text)
+            coverages.append(universe.semantic_coverage(token_ids))
+        semantic_coverage = round(float(np.mean(coverages)), 4)
+
     grav_results = {
-        "perplexity":          round(grav_ppl, 4),
-        "distinct_1":          round(distinct_n(grav_texts, 1), 4),
-        "distinct_2":          round(distinct_n(grav_texts, 2), 4),
-        "avg_length":          round(avg_length(grav_texts), 2),
-        "total_time_s":        round(grav_total_time, 3),
-        "ms_per_token":        round(grav_total_time * 1000 / (grav_total_tokens + 1e-8), 2),
+        "perplexity":           round(grav_ppl, 4),
+        "distinct_1":           round(distinct_n(grav_texts, 1), 4),
+        "distinct_2":           round(distinct_n(grav_texts, 2), 4),
+        "avg_length":           round(avg_length(grav_texts), 2),
+        "total_time_s":         round(grav_total_time, 3),
+        "ms_per_token":         round(grav_total_time * 1000 / (grav_total_tokens + 1e-8), 2),
+        "semantic_coverage":    semantic_coverage,
         "step_metrics_summary": step_summary,
-        "texts":               grav_texts,
+        "texts":                grav_texts,
     }
 
     # -------------------------------------------------------------------

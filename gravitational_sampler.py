@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from adaptive_dbscan import AdaptiveDBSCAN
 from adaptive_g import AdaptiveG
+from universe_builder import Universe
 from context_body import ContextBody
 from context_body_record import ContextBodyRecord
 from context_body_store import ContextBodyStore
@@ -56,6 +57,9 @@ class GravitationalSampler:
         recency_decay_lambda: float = 0.0,
         adaptive_g: AdaptiveG | None = None,
         adaptive_dbscan: AdaptiveDBSCAN | None = None,
+        universe: Universe | None = None,
+        use_context_bodies: bool = True,
+        deterministic: bool = False,
         domain: str = "",
         domain_classifier: DomainClassifier | None = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -72,6 +76,9 @@ class GravitationalSampler:
         self.recency_decay_lambda = recency_decay_lambda
         self.adaptive_g = adaptive_g
         self.adaptive_dbscan = adaptive_dbscan
+        self.universe = universe
+        self.use_context_bodies = use_context_bodies
+        self.deterministic = deterministic
         self.domain = domain
         self.domain_classifier = domain_classifier
         self.device = device
@@ -155,24 +162,29 @@ class GravitationalSampler:
 
         self.orbital_state = OrbitalState.initialize(initial_pos)
 
-        # Derive eps from the prompt's embedding geometry if adaptive_dbscan
-        # is configured; otherwise fall back to the fixed dbscan_eps param.
-        if self.adaptive_dbscan is not None:
-            eps = self.adaptive_dbscan.initialize_eps(embs_np)
-            min_samples = self.adaptive_dbscan.min_samples
+        # --- Context body layer (DBSCAN) — optional ---
+        if self.use_context_bodies:
+            if self.adaptive_dbscan is not None:
+                eps = self.adaptive_dbscan.initialize_eps(embs_np)
+                min_samples = self.adaptive_dbscan.min_samples
+            else:
+                eps = self.dbscan_eps
+                min_samples = self.dbscan_min_samples
+
+            self.clustering = IncrementalDBSCAN(
+                eps=eps,
+                min_samples=min_samples,
+                dim=embedding_dim,
+            )
+            for i in range(context_embeddings.shape[0]):
+                self.clustering.update(token_id=-i, embedding=embs_np[i])
         else:
-            eps = self.dbscan_eps
-            min_samples = self.dbscan_min_samples
+            self.clustering = None
 
-        self.clustering = IncrementalDBSCAN(
-            eps=eps,
-            min_samples=min_samples,
-            dim=embedding_dim,
-        )
-
-        for i in range(context_embeddings.shape[0]):
-            self.clustering.update(token_id=-i, embedding=embs_np[i])
-
+        # --- Active bodies: universe (permanent) + store records (cross-session) ---
+        # Universe bodies are not stored in active_bodies list — they are handled
+        # separately in sample() via Universe.compute_field() for efficiency.
+        # Store records are still loaded for cross-session resonance.
         self.active_bodies = [
             (-1, record, dist)
             for record, dist in self.body_store.query_nearby(
@@ -457,6 +469,14 @@ class GravitationalSampler:
                 r = np.maximum(1.0 - cos_sims, 1e-6)
                 force_magnitudes += self.G * token_mass * joint_mass / (r ** 2)
 
+        # Universe field: batched matrix multiply over all universe bodies.
+        # Provides the background gravitational field from pre-computed vocabulary
+        # clusters. This is separate from (and added to) the context body field.
+        if self.universe is not None:
+            force_magnitudes += self.universe.compute_field(
+                embs_norm, self.G, token_mass
+            )
+
         # Apply IDF to the output field so common tokens (EOS, articles,
         # punctuation) receive reduced gravitational amplification even when
         # they are geometrically close to a body centroid.  This is independent
@@ -488,7 +508,13 @@ class GravitationalSampler:
             probs = probs * gravity_weights
             probs = probs / probs.sum()
 
-        token_idx = int(torch.multinomial(probs, num_samples=1).item())
+        # Deterministic mode: argmax on the gravity-weighted distribution.
+        # Diversity comes entirely from universe geometry rather than stochastic
+        # sampling — same prompt always produces the same output.
+        if self.deterministic:
+            token_idx = int(probs.argmax().item())
+        else:
+            token_idx = int(torch.multinomial(probs, num_samples=1).item())
         return token_idx
 
     def post_step(
