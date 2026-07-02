@@ -115,6 +115,14 @@ class GravitationalSampler:
         # None until precompute_idf_weights() is called.
         self._idf_weights: np.ndarray | None = None
 
+        # Diagnostic state — populated each sample() call when log_diagnostics=True.
+        # Access via get_last_diagnostic_info() after each step.
+        self._last_diagnostic_info: dict | None = None
+
+        # Tokenizer for readable token strings in diagnostics.
+        # Set via set_tokenizer(); optional.
+        self._tokenizer = None
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
@@ -147,6 +155,36 @@ class GravitationalSampler:
         idf = -np.log(probs + 1e-8)
         idf_min, idf_max = idf.min(), idf.max()
         self._idf_weights = (idf - idf_min) / (idf_max - idf_min + 1e-8)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def set_tokenizer(self, tokenizer) -> None:
+        """Attach a tokenizer for human-readable token strings in diagnostic output."""
+        self._tokenizer = tokenizer
+
+    def get_last_diagnostic_info(self) -> "dict | None":
+        """
+        Return diagnostic data from the most recent sample() call.
+
+        Returns None if sample() has not been called yet.
+
+        Keys in returned dict:
+            top_tokens  : list of dicts — top-k tokens by gravitational force:
+                          {token_id, token_str, category, force, idf_weight,
+                           base_prob, boosted_prob}
+            force_mean  : float — mean force magnitude across vocabulary
+            force_max   : float — maximum force magnitude
+            n_influenced: int   — tokens with force > escape_threshold
+            escape_rate : float — fraction of tokens below escape_threshold
+            active_bodies: int  — number of active local bodies
+        """
+        return self._last_diagnostic_info
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
 
     def initialize(
         self,
@@ -611,14 +649,26 @@ class GravitationalSampler:
         # to raw logits.  Tokens with near-zero model probability stay near-zero
         # regardless of gravitational pull — the model's diversity is preserved.
         probs = torch.softmax(logits, dim=-1)
+        base_probs_np: np.ndarray | None = None
         if np.any(force_magnitudes > 0):
             gravity_weights = torch.tensor(
                 1.0 + force_magnitudes,
                 dtype=logits.dtype,
                 device=logits.device,
             )
+            base_probs_np = probs.detach().cpu().numpy()
             probs = probs * gravity_weights
             probs = probs / probs.sum()
+
+        # Build diagnostic info for this step (always populated so callers
+        # can inspect the field even when log_diagnostics is False).
+        self._last_diagnostic_info = self._build_diagnostic_info(
+            force_magnitudes=force_magnitudes,
+            base_probs_np=base_probs_np if base_probs_np is not None
+                          else probs.detach().cpu().numpy(),
+            boosted_probs_np=probs.detach().cpu().numpy(),
+            vocab_size=vocab_size,
+        )
 
         # Deterministic mode: argmax on the gravity-weighted distribution.
         # Diversity comes entirely from universe geometry rather than stochastic
@@ -628,6 +678,74 @@ class GravitationalSampler:
         else:
             token_idx = int(torch.multinomial(probs, num_samples=1).item())
         return token_idx
+
+    def _build_diagnostic_info(
+        self,
+        force_magnitudes: np.ndarray,
+        base_probs_np: np.ndarray,
+        boosted_probs_np: np.ndarray,
+        vocab_size: int,
+        top_k: int = 10,
+    ) -> dict:
+        """Build the diagnostic dict for the last sample() call."""
+        top_indices = np.argsort(force_magnitudes)[-top_k:][::-1]
+        idf_arr = self._idf_weights if self._idf_weights is not None else np.ones(vocab_size)
+
+        _FUNCTION_WORDS = frozenset({
+            "the", "a", "an", "is", "are", "was", "were", "be", "been",
+            "have", "has", "had", "do", "does", "did", "will", "would",
+            "could", "should", "of", "in", "on", "at", "to", "for",
+            "with", "from", "by", "as", "it", "its", "and", "or", "but",
+            "not", "no", "i", "we", "you", "he", "she", "they",
+        })
+        _PUNCT = frozenset(".,;:!?()[]{}'\"-_")
+
+        def _category(s: str) -> str:
+            if not s or s.isspace():
+                return "whitespace"
+            if s.startswith("<") and s.endswith(">"):
+                return "eos/special"
+            inner = s.strip()
+            if all(c in _PUNCT for c in inner):
+                return "punctuation"
+            if inner.lower() in _FUNCTION_WORDS:
+                return "function_word"
+            if s.startswith(" "):
+                return "content_word"
+            return "subword"
+
+        top_tokens = []
+        for idx in top_indices:
+            idx_int = int(idx)
+            if self._tokenizer is not None:
+                try:
+                    tok_str = self._tokenizer.decode([idx_int])
+                except Exception:
+                    tok_str = f"<id={idx_int}>"
+            else:
+                tok_str = f"<id={idx_int}>"
+
+            top_tokens.append({
+                "token_id":   idx_int,
+                "token_str":  tok_str,
+                "category":   _category(tok_str),
+                "force":      float(force_magnitudes[idx_int]),
+                "idf_weight": float(idf_arr[idx_int]) if idx_int < len(idf_arr) else 1.0,
+                "base_prob":  float(base_probs_np[idx_int]) if idx_int < len(base_probs_np) else 0.0,
+                "boosted_prob": float(boosted_probs_np[idx_int]) if idx_int < len(boosted_probs_np) else 0.0,
+            })
+
+        n_influenced = int(np.sum(force_magnitudes >= self.escape_threshold))
+        escape_rate = 1.0 - (n_influenced / (vocab_size + 1e-8))
+
+        return {
+            "top_tokens":    top_tokens,
+            "force_mean":    float(force_magnitudes.mean()),
+            "force_max":     float(force_magnitudes.max()),
+            "n_influenced":  n_influenced,
+            "escape_rate":   round(escape_rate, 4),
+            "active_bodies": len(self.active_bodies),
+        }
 
     def post_step(
         self,
@@ -641,17 +759,7 @@ class GravitationalSampler:
         Must be called after every sample() call with the embedding of the
         returned token. This is what drives body formation — without it,
         active_bodies remains empty and the gravitational field is never built.
-
-        Responsibilities:
-            1. Feed the token into IncrementalDBSCAN.
-            2. Rebuild active_bodies from current cluster state.
-            3. Persist newly stable bodies to the store.
-            4. Boost resonance for collision-event pairs.
-            5. Run inelastic collision check on active_bodies.
         """
-        # Domain classifier and AdaptiveG always run, regardless of whether
-        # local context body clustering is enabled. Both depend only on the
-        # escape rate computed during sample(), not on DBSCAN state.
         if self.domain_classifier is not None:
             self.domain = self.domain_classifier.update(token_embedding)
 
@@ -666,13 +774,9 @@ class GravitationalSampler:
                 domain=self.domain,
             )
 
-        # Everything below requires local context body clustering.
         if self.clustering is None:
             return
 
-        # Scale token mass by IDF weight so common tokens (punctuation, articles,
-        # EOS) accrete less mass onto bodies than rare, semantically specific tokens.
-        # Prompt tokens (negative ids) skip IDF weighting.
         effective_mass = token_mass
         if (
             self._idf_weights is not None
@@ -687,12 +791,9 @@ class GravitationalSampler:
             token_mass=effective_mass,
         )
 
-        # Remove merged-away labels from the record mapping
         for old_label, _ in merged_events:
             self._label_record_ids.pop(old_label, None)
 
-        # Rebuild cluster portion of active_bodies from current DBSCAN state.
-        # Keep store records (label=-1) in place; replace all label>=0 entries.
         store_entries = [
             entry for entry in self.active_bodies
             if not isinstance(entry[1], ContextBody)
@@ -702,7 +803,6 @@ class GravitationalSampler:
             body = self.clustering._make_body(label)
             cluster_entries.append((label, body, 0.0))
 
-            # Persist body if stable and not yet persisted
             if (
                 body.stability >= self.stability_threshold
                 and label not in self._label_record_ids
@@ -718,21 +818,15 @@ class GravitationalSampler:
 
         self.active_bodies = store_entries + cluster_entries
 
-        # Collision events → resonance boost for persisted pairs
         for label_a, label_b, _dist in collision_events:
             id_a = self._label_record_ids.get(label_a)
             id_b = self._label_record_ids.get(label_b)
             if id_a and id_b:
                 self.body_store.record_resonance(id_a, id_b, delta=0.2)
 
-        # Inelastic collision check within active bodies (same session)
         self._check_collisions()
-
-        # Cross-session collision check: merge newly persisted local bodies
-        # with overlapping store records from previous sessions
         self._check_cross_session_collisions()
 
-        # Update adaptive clustering radius toward target body count
         if self.adaptive_dbscan is not None:
             new_eps = self.adaptive_dbscan.update(len(self.active_bodies))
             self.clustering.eps = new_eps

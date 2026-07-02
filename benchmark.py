@@ -2,15 +2,29 @@
 benchmark.py — compare gravitational sampling against temperature baseline.
 
 Usage:
-    python benchmark.py
+    # Standard comparison (temperature vs gravitational)
+    python benchmark.py --universe-path universe.npz --G-universe 1.0
+
+    # Ablation battery (real/shuffled/random/no-idf/uniform-mass/local-only/combined)
+    python benchmark.py --ablation --universe-path universe.npz --G-universe 1.0
+
+    # Include top-p and typical sampling baselines
+    python benchmark.py --baselines all --universe-path universe.npz
+
+    # Diagnostic mode: print top boosted tokens each step (first prompt only)
+    python benchmark.py --log-diagnostics --universe-path universe.npz --runs 1
+
+    # Other options
     python benchmark.py --model gpt2-medium --max-tokens 150 --runs 3
-    python benchmark.py --prompts-file my_prompts.txt --G 2.0 --temperature 0.8
-    python benchmark.py --output results/run1
+    python benchmark.py --prompts-file my_prompts.txt --G-universe 2.0
+    python benchmark.py --output results/run1 --seed 42
 
 Outputs:
-    <output-dir>/results.json   — full numeric results
-    <output-dir>/summary.txt    — human-readable table
-    <output-dir>/steps.json     — per-step gravitational metrics
+    <output-dir>/results.json       — full numeric results
+    <output-dir>/summary.txt        — human-readable comparison table
+    <output-dir>/steps.json         — per-step gravitational metrics
+    <output-dir>/ablation.txt       — ablation comparison table (--ablation mode)
+    <output-dir>/diagnostics.json   — per-step top-boosted-token data (--log-diagnostics)
 """
 
 from __future__ import annotations
@@ -68,6 +82,17 @@ def distinct_n(texts: list[str], n: int) -> float:
     if not all_ngrams:
         return 0.0
     return len(set(all_ngrams)) / len(all_ngrams)
+
+
+def repetition_rate(texts: list[str], n: int = 2) -> float:
+    """
+    Fraction of n-grams that are repeated (i.e. not unique).
+
+    Complement of distinct_n: repetition_rate = 1 - distinct_n.
+    Reported separately because it maps directly to the failure mode name
+    (\"repetition\") that reviewers check for.
+    """
+    return 1.0 - distinct_n(texts, n)
 
 
 def perplexity(
@@ -144,6 +169,66 @@ def generate_temperature(
     return text, elapsed
 
 
+def generate_topp(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    device: str,
+) -> tuple[str, float]:
+    """Nucleus (top-p) sampling baseline. Returns (text, elapsed_seconds)."""
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    attention_mask = torch.ones_like(input_ids)
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        out = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    elapsed = time.perf_counter() - t0
+    return tokenizer.decode(out[0], skip_special_tokens=True), elapsed
+
+
+def generate_typical(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+    max_tokens: int,
+    typical_p: float,
+    device: str,
+) -> tuple[str, float]:
+    """
+    Locally typical sampling baseline (Meister et al., 2023).
+
+    Selects tokens whose information content is close to the conditional
+    entropy of the distribution, avoiding both the most predictable and the
+    most surprising tokens.
+
+    Returns (text, elapsed_seconds).
+    """
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    attention_mask = torch.ones_like(input_ids)
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        out = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_tokens,
+            do_sample=True,
+            typical_p=typical_p,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    elapsed = time.perf_counter() - t0
+    return tokenizer.decode(out[0], skip_special_tokens=True), elapsed
+
+
 @dataclass
 class StepMetrics:
     step: int
@@ -160,10 +245,12 @@ def generate_gravitational(
     max_tokens: int,
     sampler: GravitationalSampler,
     device: str,
-) -> tuple[str, float, list[StepMetrics]]:
+    collect_diagnostics: bool = False,
+) -> "tuple[str, float, list[StepMetrics], list[dict]]":
     """
     Gravitational sampling with per-step metric collection.
-    Returns (text, elapsed_seconds, step_metrics).
+    Returns (text, elapsed_seconds, step_metrics, diagnostic_data).
+    diagnostic_data is a list of per-step dicts (empty if collect_diagnostics=False).
     """
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     token_embeddings = model.get_input_embeddings().weight
@@ -176,6 +263,7 @@ def generate_gravitational(
 
     generated = input_ids[0].tolist()
     step_metrics: list[StepMetrics] = []
+    diagnostic_data: list[dict] = []
     total_start = time.perf_counter()
     past_key_values = None
 
@@ -221,13 +309,21 @@ def generate_gravitational(
             G_eff=G_eff,
         ))
 
+        # Collect per-step diagnostic info (top-boosted tokens)
+        if collect_diagnostics:
+            info = sampler.get_last_diagnostic_info()
+            if info is not None:
+                info = dict(info)
+                info["step"] = step
+                diagnostic_data.append(info)
+
         generated.append(next_token)
         if next_token == tokenizer.eos_token_id:
             break
 
     elapsed = time.perf_counter() - total_start
     text = tokenizer.decode(generated, skip_special_tokens=True)
-    return text, elapsed, step_metrics
+    return text, elapsed, step_metrics, diagnostic_data
 
 
 # ---------------------------------------------------------------------------
@@ -407,182 +503,76 @@ def parse_args() -> argparse.Namespace:
                    help="Output directory (default: benchmark_results)")
     p.add_argument("--device", default=None,
                    help="Device: cuda / cpu (auto-detected if omitted)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Global random seed for reproducibility (default: None = non-deterministic). "
+                        "Sets numpy + torch seeds before each run.")
+
+    # ── Additional baselines ────────────────────────────────────────────────
+    p.add_argument("--baselines", default="temperature",
+                   choices=["temperature", "topp", "typical", "all"],
+                   help="Which baselines to run. 'temperature' = default single baseline. "
+                        "'topp' adds nucleus sampling. 'typical' adds typical sampling. "
+                        "'all' runs temperature + top-p + typical (default: temperature).")
+    p.add_argument("--top-p", type=float, default=0.9, dest="top_p",
+                   help="Nucleus sampling p parameter (default: 0.9). Used when --baselines "
+                        "includes 'topp' or 'all'.")
+    p.add_argument("--typical-p", type=float, default=0.95, dest="typical_p",
+                   help="Typical sampling p parameter (default: 0.95). Used when --baselines "
+                        "includes 'typical' or 'all'.")
+
+    # ── Ablation mode ───────────────────────────────────────────────────────
+    p.add_argument("--ablation", action="store_true",
+                   help="Run full ablation battery: real universe, shuffled centroids, "
+                        "random centroids, no-IDF, uniform mass, local-only, and combined. "
+                        "Requires --universe-path or --build-universe. "
+                        "Outputs ablation.txt comparison table.")
+    p.add_argument("--ablation-conditions", default=None,
+                   help="Comma-separated subset of ablation conditions to run. "
+                        "Available: real,shuffled,random,no_idf,uniform_mass,local_only,combined. "
+                        "Default (when --ablation is set): all conditions.")
+
+    # ── Diagnostics ─────────────────────────────────────────────────────────
+    p.add_argument("--log-diagnostics", action="store_true",
+                   help="Print top boosted tokens at each generation step. "
+                        "Runs only on the first prompt to limit output. "
+                        "Saves full data to diagnostics.json.")
+
     return p.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+# ---------------------------------------------------------------------------
+# Ablation runner
+# ---------------------------------------------------------------------------
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nDevice: {device}")
-
-    # Load model
-    print(f"Loading {args.model}...")
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
-    model.to(device)
-    model.eval()
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Load prompts
-    if args.prompts_file:
-        prompts = Path(args.prompts_file).read_text().strip().splitlines()
-        prompts = [p.strip() for p in prompts if p.strip()]
-    else:
-        prompts = DEFAULT_PROMPTS
-
-    print(f"Prompts: {len(prompts)}  |  max_tokens: {args.max_tokens}  |  runs: {args.runs}")
-    G_local = args.G_local if args.G_local is not None else args.G_base
-    print(f"G_local={G_local}  G_universe={args.G_universe}  temperature={args.temperature}  adaptive_g={args.adaptive_g}")
-    print(f"cluster_radius={args.cluster_radius}  cluster_min_tokens={args.cluster_min_tokens}\n")
-
-    # Output dir
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Config dict — built early so temperature-only mode can use it
-    config = {
-        "model":               args.model,
-        "num_prompts":         len(prompts),
-        "max_tokens":          args.max_tokens,
-        "runs":                args.runs,
-        "temperature":         args.temperature,
-        "G_local":             G_local,
-        "G_universe":          args.G_universe,
-        "G_base":              args.G_base if args.adaptive_g else None,
-        "adaptive_g":          args.adaptive_g,
-        "escape_rate_target":  args.escape_rate_target if args.adaptive_g else None,
-        "mass_damping":        args.mass_damping if args.adaptive_g else None,
-        "adaptive_clustering": args.adaptive_clustering,
-        "target_bodies":       args.target_bodies if args.adaptive_clustering else None,
-        "eps_percentile":      args.eps_percentile if args.adaptive_clustering else None,
-        "eps_adjustment_rate": args.eps_adjustment_rate if args.adaptive_clustering else None,
-        "universe_path":       args.universe_path,
-        "universe_clusters":   args.universe_clusters,
-        "universe_mass":       args.universe_mass,
-        "local_bodies":        args.local_bodies,
-        "deterministic":       args.deterministic,
-        "device":              device,
-    }
-
-    # -------------------------------------------------------------------
-    # Temperature baseline
-    # -------------------------------------------------------------------
-    print("Running temperature baseline...")
-    temp_texts: list[str] = []
-    temp_times: list[float] = []
-    temp_token_counts: list[int] = []
-
-    for i, prompt in enumerate(prompts):
-        for run in range(args.runs):
-            print(f"  prompt {i+1}/{len(prompts)}, run {run+1}/{args.runs}", end="\r")
-            text, elapsed = generate_temperature(
-                model, tokenizer, prompt,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                device=device,
-            )
-            generated_only = text[len(prompt):]
-            n_tokens = len(tokenizer.encode(generated_only))
-            temp_texts.append(text)
-            temp_times.append(elapsed)
-            temp_token_counts.append(n_tokens)
-
-    print("\nTemperature baseline complete.")
-    temp_ppl = perplexity(model, tokenizer, temp_texts, device)
-    temp_total_tokens = sum(temp_token_counts)
-    temp_total_time = sum(temp_times)
-
-    temp_results = {
-        "perplexity":   round(temp_ppl, 4),
-        "distinct_1":   round(distinct_n(temp_texts, 1), 4),
-        "distinct_2":   round(distinct_n(temp_texts, 2), 4),
-        "avg_length":   round(avg_length(temp_texts), 2),
-        "total_time_s": round(temp_total_time, 3),
-        "ms_per_token": round(temp_total_time * 1000 / (temp_total_tokens + 1e-8), 2),
-        "texts":        temp_texts,
-    }
-
+def _run_one_condition(
+    label: str,
+    model,
+    tokenizer,
+    prompts: list[str],
+    args,
+    device: str,
+    G_local: float,
+    universe,           # Universe | None — the condition-specific universe variant
+    use_idf: bool,
+    local_bodies: bool,
+    idf_weights,
+    seed: int | None,
+    collect_diagnostics: bool = False,
+) -> dict:
+    """Run gravitational sampling for one ablation condition. Returns metrics dict."""
     embedding_dim = model.get_input_embeddings().weight.shape[1]
 
-    # -------------------------------------------------------------------
-    # Universe setup (runs before temperature-only early exit so that
-    # --build-universe --temperature-only still produces the .npz file)
-    # -------------------------------------------------------------------
-    universe: Universe | None = None
-
-    if args.universe_path:
-        print(f"Loading universe from {args.universe_path}...")
-        universe = Universe.load(args.universe_path)
-        print(f"  Loaded: {universe.n_bodies} bodies, dim={universe.centroids.shape[1]}")
-    elif args.build_universe:
-        print(f"Building universe ({args.universe_clusters} clusters, mass={args.universe_mass})...")
-        builder = UniverseBuilder()
-        universe = builder.build(
-            model=model,
-            n_clusters=args.universe_clusters,
-            mass_scheme=args.universe_mass,
-        )
-        universe_path = out_dir / "universe.npz"
-        universe.save(universe_path)
-        config["universe_path"] = str(universe_path)
-        print(f"  Universe saved to {universe_path}")
-
-    # -------------------------------------------------------------------
-    # Gravitational sampling (skipped with --temperature-only)
-    # -------------------------------------------------------------------
-    if args.temperature_only:
-        print("\nTemperature-only mode: skipping gravitational sampling.")
-        print_summary({"config": config, "temperature": temp_results, "gravitational": None})
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            print_summary({"config": config, "temperature": temp_results, "gravitational": None})
-        (out_dir / "summary.txt").write_text(buf.getvalue())
-        (out_dir / "results.json").write_text(json.dumps(
-            {"config": config, "temperature": temp_results}, indent=2))
-        print(f"Results saved to {out_dir}/")
-        return
-
-    print("Running gravitational sampling...")
-    grav_texts: list[str] = []
-    grav_times: list[float] = []
-    grav_token_counts: list[int] = []
+    texts: list[str] = []
+    times: list[float] = []
+    token_counts: list[int] = []
     all_step_metrics: list[dict] = []
-
-    adaptive_g = AdaptiveG(
-        G_base=args.G_base,
-        escape_rate_target=args.escape_rate_target,
-        mass_damping=args.mass_damping,
-    ) if args.adaptive_g else None
-    # G_local is fixed when --adaptive-g is not set
-
-    adaptive_dbscan = AdaptiveDBSCAN(
-        target_bodies=args.target_bodies,
-        eps_percentile=args.eps_percentile,
-        min_samples=args.cluster_min_tokens,
-        adjustment_rate=args.eps_adjustment_rate,
-    ) if args.adaptive_clustering else None
-
-    # Precompute IDF weights once from the model's unconditional distribution.
-    # Shared across all sampler instances — only depends on the model, not the prompt.
-    idf_weights = None
-    if not args.no_idf:
-        print("Precomputing IDF weights...")
-        _tmp = GravitationalSampler(
-            body_store=ContextBodyStore(embedding_dim=embedding_dim, decay_interval=9999),
-            G=1.0,
-        )
-        _tmp.precompute_idf_weights(model)
-        idf_weights = _tmp._idf_weights
-        print(f"  IDF weights computed. Min={idf_weights.min():.3f} Max={idf_weights.max():.3f} "
-              f"Mean={idf_weights.mean():.3f}")
+    all_diagnostic_data: list[dict] = []
 
     for i, prompt in enumerate(prompts):
         for run in range(args.runs):
-            print(f"  prompt {i+1}/{len(prompts)}, run {run+1}/{args.runs}", end="\r")
+            if seed is not None:
+                np.random.seed(seed + i * 100 + run)
+                torch.manual_seed(seed + i * 100 + run)
 
             store = ContextBodyStore(embedding_dim=embedding_dim, decay_interval=9999)
             sampler = GravitationalSampler(
@@ -591,66 +581,426 @@ def main() -> None:
                 G_universe=args.G_universe,
                 escape_threshold=args.escape_threshold,
                 recency_decay_lambda=args.recency_decay,
-                adaptive_g=adaptive_g,
-                adaptive_dbscan=adaptive_dbscan,
                 universe=universe,
-                use_context_bodies=args.local_bodies,
+                use_context_bodies=local_bodies,
                 deterministic=args.deterministic,
                 device=device,
                 cluster_radius=args.cluster_radius,
                 cluster_min_tokens=args.cluster_min_tokens,
             )
-            sampler._idf_weights = idf_weights  # None if --no-idf
+            sampler._idf_weights = idf_weights if use_idf else None
+            if collect_diagnostics and i == 0 and run == 0:
+                sampler.set_tokenizer(tokenizer)
 
-            text, elapsed, step_mets = generate_gravitational(
+            do_diag = collect_diagnostics and i == 0 and run == 0
+            text, elapsed, step_mets, diag_data = generate_gravitational(
                 model, tokenizer, prompt,
                 max_tokens=args.max_tokens,
                 sampler=sampler,
                 device=device,
+                collect_diagnostics=do_diag,
             )
 
-            generated_only = text[len(prompt):]
-            n_tokens = len(tokenizer.encode(generated_only))
-            grav_texts.append(text)
-            grav_times.append(elapsed)
-            grav_token_counts.append(n_tokens)
+            gen_only = text[len(prompt):]
+            n_tokens = len(tokenizer.encode(gen_only))
+            texts.append(text)
+            times.append(elapsed)
+            token_counts.append(n_tokens)
 
             for sm in step_mets:
                 d = asdict(sm)
                 d["prompt_idx"] = i
                 d["run"] = run
+                d["condition"] = label
                 all_step_metrics.append(d)
+
+            if do_diag:
+                all_diagnostic_data.extend(diag_data)
+
+    ppl = perplexity(model, tokenizer, texts, device)
+    total_tokens = sum(token_counts)
+    total_time = sum(times)
+
+    escape_rates = [m["escape_rate"] for m in all_step_metrics]
+    active_bodies_list = [m["active_bodies"] for m in all_step_metrics]
+
+    return {
+        "label":          label,
+        "perplexity":     round(ppl, 4),
+        "distinct_1":     round(distinct_n(texts, 1), 4),
+        "distinct_2":     round(distinct_n(texts, 2), 4),
+        "rep_rate_2":     round(repetition_rate(texts, 2), 4),
+        "avg_length":     round(avg_length(texts), 2),
+        "total_time_s":   round(total_time, 3),
+        "ms_per_token":   round(total_time * 1000 / (total_tokens + 1e-8), 2),
+        "mean_escape_rate":   round(float(np.mean(escape_rates)), 4) if escape_rates else None,
+        "mean_active_bodies": round(float(np.mean(active_bodies_list)), 2) if active_bodies_list else None,
+        "texts":          texts,
+        "step_metrics":   all_step_metrics,
+        "diagnostic_data": all_diagnostic_data,
+    }
+
+
+def _run_baseline(
+    label: str,
+    model,
+    tokenizer,
+    prompts: list[str],
+    args,
+    device: str,
+    mode: str,   # "temperature" | "topp" | "typical"
+    seed: int | None,
+) -> dict:
+    """Run one sampling baseline (temperature/top-p/typical). Returns metrics dict."""
+    texts: list[str] = []
+    times: list[float] = []
+    token_counts: list[int] = []
+
+    for i, prompt in enumerate(prompts):
+        for run in range(args.runs):
+            if seed is not None:
+                np.random.seed(seed + i * 100 + run)
+                torch.manual_seed(seed + i * 100 + run)
+
+            if mode == "temperature":
+                text, elapsed = generate_temperature(
+                    model, tokenizer, prompt, args.max_tokens, args.temperature, device,
+                )
+            elif mode == "topp":
+                text, elapsed = generate_topp(
+                    model, tokenizer, prompt, args.max_tokens,
+                    args.temperature, args.top_p, device,
+                )
+            elif mode == "typical":
+                text, elapsed = generate_typical(
+                    model, tokenizer, prompt, args.max_tokens, args.typical_p, device,
+                )
+            else:
+                raise ValueError(f"Unknown baseline mode: {mode!r}")
+
+            gen_only = text[len(prompt):]
+            n_tokens = len(tokenizer.encode(gen_only))
+            texts.append(text)
+            times.append(elapsed)
+            token_counts.append(n_tokens)
+
+    total_tokens = sum(token_counts)
+    total_time = sum(times)
+
+    return {
+        "label":        label,
+        "perplexity":   round(perplexity(model, tokenizer, texts, device), 4),
+        "distinct_1":   round(distinct_n(texts, 1), 4),
+        "distinct_2":   round(distinct_n(texts, 2), 4),
+        "rep_rate_2":   round(repetition_rate(texts, 2), 4),
+        "avg_length":   round(avg_length(texts), 2),
+        "total_time_s": round(total_time, 3),
+        "ms_per_token": round(total_time * 1000 / (total_tokens + 1e-8), 2),
+        "texts":        texts,
+    }
+
+
+def print_ablation_table(conditions: list[dict]) -> str:
+    """Format an ablation comparison table. Returns the table string (also prints it)."""
+    cols = [
+        ("method",    "label",               "<", 28),
+        ("ppl",       "perplexity",          ">",  8),
+        ("dist-1",    "distinct_1",          ">",  7),
+        ("dist-2",    "distinct_2",          ">",  7),
+        ("rep-2",     "rep_rate_2",          ">",  7),
+        ("ms/tok",    "ms_per_token",        ">",  8),
+        ("esc_rate",  "mean_escape_rate",    ">",  9),
+        ("bodies",    "mean_active_bodies",  ">",  7),
+    ]
+    header = "  " + "  ".join(f"{name:{align}{width}}" for name, _, align, width in cols)
+    sep    = "  " + "  ".join("-" * width for _, _, _, width in cols)
+    lines  = ["", "=" * (len(header) + 2), "  contextbodies ablation table",
+              "=" * (len(header) + 2), header, sep]
+
+    for cond in conditions:
+        parts = []
+        for name, key, align, width in cols:
+            val = cond.get(key)
+            if val is None:
+                cell = "—"
+            elif key == "label":
+                cell = str(val)
+            elif isinstance(val, float):
+                cell = f"{val:.4f}" if key not in ("ms_per_token", "perplexity") else f"{val:.2f}"
+            else:
+                cell = str(val)
+            parts.append(f"{cell:{align}{width}}")
+        lines.append("  " + "  ".join(parts))
+
+    lines += ["=" * (len(header) + 2), ""]
+    table = "\n".join(lines)
+    print(table)
+    return table
+
+
+def main() -> None:
+    args = parse_args()
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nDevice: {device}")
+
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        print(f"Seed: {args.seed}")
+
+    print(f"Loading {args.model}...")
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
+    model.to(device)
+    model.eval()
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if args.prompts_file:
+        prompts = Path(args.prompts_file).read_text().strip().splitlines()
+        prompts = [p.strip() for p in prompts if p.strip()]
+    else:
+        prompts = DEFAULT_PROMPTS
+
+    G_local = args.G_local if args.G_local is not None else args.G_base
+    print(f"Prompts: {len(prompts)}  max_tokens: {args.max_tokens}  runs: {args.runs}")
+    print(f"G_local={G_local}  G_universe={args.G_universe}  temperature={args.temperature}\n")
+
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    embedding_dim = model.get_input_embeddings().weight.shape[1]
+
+    config = {
+        "model": args.model, "num_prompts": len(prompts), "max_tokens": args.max_tokens,
+        "runs": args.runs, "seed": args.seed, "temperature": args.temperature,
+        "G_local": G_local, "G_universe": args.G_universe,
+        "G_base": args.G_base if args.adaptive_g else None,
+        "adaptive_g": args.adaptive_g,
+        "escape_rate_target": args.escape_rate_target if args.adaptive_g else None,
+        "mass_damping": args.mass_damping if args.adaptive_g else None,
+        "adaptive_clustering": args.adaptive_clustering,
+        "universe_path": args.universe_path, "universe_clusters": args.universe_clusters,
+        "universe_mass": args.universe_mass, "local_bodies": args.local_bodies,
+        "deterministic": args.deterministic, "device": device,
+        "baselines": args.baselines, "top_p": args.top_p, "typical_p": args.typical_p,
+    }
+
+    # ── Universe ──────────────────────────────────────────────────────────
+    universe: Universe | None = None
+    if args.universe_path:
+        print(f"Loading universe from {args.universe_path}...")
+        universe = Universe.load(args.universe_path)
+        print(f"  Loaded: {universe.n_bodies} bodies, dim={universe.centroids.shape[1]}")
+    elif args.build_universe:
+        print(f"Building universe ({args.universe_clusters} clusters, mass={args.universe_mass})...")
+        builder = UniverseBuilder()
+        universe = builder.build(model=model, n_clusters=args.universe_clusters,
+                                 mass_scheme=args.universe_mass)
+        universe_path = out_dir / "universe.npz"
+        universe.save(universe_path)
+        config["universe_path"] = str(universe_path)
+        print(f"  Universe saved to {universe_path}")
+
+    # ── IDF weights ───────────────────────────────────────────────────────
+    idf_weights = None
+    if not args.no_idf:
+        print("Precomputing IDF weights...")
+        _tmp = GravitationalSampler(
+            body_store=ContextBodyStore(embedding_dim=embedding_dim, decay_interval=9999), G=1.0)
+        _tmp.precompute_idf_weights(model)
+        idf_weights = _tmp._idf_weights
+        print(f"  IDF: min={idf_weights.min():.3f}  max={idf_weights.max():.3f}  "
+              f"mean={idf_weights.mean():.3f}")
+
+    # ── Baselines ─────────────────────────────────────────────────────────
+    run_topp    = args.baselines in ("topp",    "all")
+    run_typical = args.baselines in ("typical", "all")
+
+    print("Running temperature baseline...")
+    temp_result = _run_baseline("temperature", model, tokenizer, prompts,
+                                args, device, "temperature", args.seed)
+    print("  done.")
+
+    topp_result: dict | None = None
+    if run_topp:
+        print(f"Running top-p baseline (p={args.top_p})...")
+        topp_result = _run_baseline(f"top-p (p={args.top_p})", model, tokenizer,
+                                    prompts, args, device, "topp", args.seed)
+        print("  done.")
+
+    typical_result: dict | None = None
+    if run_typical:
+        print(f"Running typical sampling (p={args.typical_p})...")
+        typical_result = _run_baseline(f"typical (p={args.typical_p})", model, tokenizer,
+                                       prompts, args, device, "typical", args.seed)
+        print("  done.")
+
+    # ── Temperature-only early exit ───────────────────────────────────────
+    if args.temperature_only:
+        print("\nTemperature-only mode: skipping gravitational sampling.")
+        print_summary({"config": config, "temperature": temp_result, "gravitational": None})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_summary({"config": config, "temperature": temp_result, "gravitational": None})
+        (out_dir / "summary.txt").write_text(buf.getvalue())
+        (out_dir / "results.json").write_text(
+            json.dumps({"config": config, "temperature": temp_result}, indent=2, default=str))
+        print(f"Results saved to {out_dir}/")
+        return
+
+    # ── Ablation mode ─────────────────────────────────────────────────────
+    if args.ablation:
+        if universe is None:
+            print("ERROR: --ablation requires --universe-path or --build-universe")
+            import sys; sys.exit(1)
+
+        all_conditions_map = {
+            "real":         ("universe (real)",        universe,                                    True,  False),
+            "shuffled":     ("shuffled centroids",     universe.shuffled(seed=args.seed),           True,  False),
+            "random":       ("random centroids",       universe.with_random_centroids(seed=args.seed), True, False),
+            "no_idf":       ("no IDF",                 universe,                                    False, False),
+            "uniform_mass": ("uniform mass",           universe.with_uniform_mass(),                True,  False),
+            "local_only":   ("local bodies only",      None,                                        True,  True),
+            "combined":     ("universe + local",       universe,                                    True,  True),
+        }
+        keys = ([k.strip() for k in args.ablation_conditions.split(",")]
+                if args.ablation_conditions else list(all_conditions_map.keys()))
+        print(f"\nRunning ablation battery: {keys}\n")
+
+        ablation_conditions: list[dict] = []
+        for bl in [temp_result, topp_result, typical_result]:
+            if bl:
+                ablation_conditions.append({**bl, "mean_escape_rate": None,
+                                             "mean_active_bodies": None, "rep_rate_2": bl.get("rep_rate_2")})
+
+        all_step_metrics: list[dict] = []
+        all_diag: list[dict] = []
+
+        for key in keys:
+            if key not in all_conditions_map:
+                print(f"  WARNING: unknown ablation condition {key!r}, skipping"); continue
+            label, univ_variant, use_idf, local_bodies = all_conditions_map[key]
+            print(f"  [{key}] {label}...")
+            cond = _run_one_condition(
+                label=label, model=model, tokenizer=tokenizer, prompts=prompts,
+                args=args, device=device, G_local=G_local, universe=univ_variant,
+                use_idf=use_idf, local_bodies=local_bodies, idf_weights=idf_weights,
+                seed=args.seed, collect_diagnostics=args.log_diagnostics,
+            )
+            ablation_conditions.append(cond)
+            all_step_metrics.extend(cond.get("step_metrics", []))
+            all_diag.extend(cond.get("diagnostic_data", []))
+            print(f"    ppl={cond['perplexity']:.2f}  dist-1={cond['distinct_1']:.4f}  "
+                  f"rep-2={cond['rep_rate_2']:.4f}  ms/tok={cond['ms_per_token']:.1f}")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_ablation_table(ablation_conditions)
+        ablation_table = buf.getvalue()
+        print(ablation_table)
+
+        (out_dir / "ablation.txt").write_text(ablation_table)
+        (out_dir / "ablation.json").write_text(json.dumps({
+            "config": config,
+            "conditions": [
+                {k: v for k, v in c.items() if k not in ("texts", "step_metrics", "diagnostic_data")}
+                for c in ablation_conditions
+            ],
+        }, indent=2, default=str))
+        (out_dir / "ablation_steps.json").write_text(
+            json.dumps(all_step_metrics, indent=2, default=str))
+        if all_diag:
+            (out_dir / "diagnostics.json").write_text(
+                json.dumps(all_diag, indent=2, default=str))
+        print(f"Ablation results saved to {out_dir}/")
+        return
+
+    # ── Standard single-condition run ─────────────────────────────────────
+    print("Running gravitational sampling...")
+
+    adaptive_g = AdaptiveG(
+        G_base=args.G_base, escape_rate_target=args.escape_rate_target,
+        mass_damping=args.mass_damping,
+    ) if args.adaptive_g else None
+
+    adaptive_dbscan = AdaptiveDBSCAN(
+        target_bodies=args.target_bodies, eps_percentile=args.eps_percentile,
+        min_samples=args.cluster_min_tokens, adjustment_rate=args.eps_adjustment_rate,
+    ) if args.adaptive_clustering else None
+
+    all_step_metrics: list[dict] = []
+    all_diag: list[dict] = []
+    grav_texts: list[str] = []
+    grav_times: list[float] = []
+    grav_token_counts: list[int] = []
+
+    for i, prompt in enumerate(prompts):
+        for run in range(args.runs):
+            print(f"  prompt {i+1}/{len(prompts)}, run {run+1}/{args.runs}", end="\r")
+            if args.seed is not None:
+                np.random.seed(args.seed + i * 100 + run)
+                torch.manual_seed(args.seed + i * 100 + run)
+
+            store = ContextBodyStore(embedding_dim=embedding_dim, decay_interval=9999)
+            sampler = GravitationalSampler(
+                body_store=store, G=G_local, G_universe=args.G_universe,
+                escape_threshold=args.escape_threshold,
+                recency_decay_lambda=args.recency_decay,
+                adaptive_g=adaptive_g, adaptive_dbscan=adaptive_dbscan,
+                universe=universe, use_context_bodies=args.local_bodies,
+                deterministic=args.deterministic, device=device,
+                cluster_radius=args.cluster_radius,
+                cluster_min_tokens=args.cluster_min_tokens,
+            )
+            sampler._idf_weights = idf_weights
+
+            do_diag = args.log_diagnostics and i == 0 and run == 0
+            if do_diag:
+                sampler.set_tokenizer(tokenizer)
+
+            text, elapsed, step_mets, diag_data = generate_gravitational(
+                model, tokenizer, prompt, max_tokens=args.max_tokens,
+                sampler=sampler, device=device, collect_diagnostics=do_diag,
+            )
+
+            gen_only = text[len(prompt):]
+            n_tokens = len(tokenizer.encode(gen_only))
+            grav_texts.append(text)
+            grav_times.append(elapsed)
+            grav_token_counts.append(n_tokens)
+
+            for sm in step_mets:
+                d = asdict(sm); d["prompt_idx"] = i; d["run"] = run
+                all_step_metrics.append(d)
+            all_diag.extend(diag_data)
 
     print("\nGravitational sampling complete.")
     grav_ppl = perplexity(model, tokenizer, grav_texts, device)
     grav_total_tokens = sum(grav_token_counts)
     grav_total_time = sum(grav_times)
 
-    # Step metrics summary
     escape_rates = [m["escape_rate"] for m in all_step_metrics]
-    active_bodies = [m["active_bodies"] for m in all_step_metrics]
-    G_effs = [m["G_eff"] for m in all_step_metrics if m["G_eff"] is not None]
+    active_bodies_list = [m["active_bodies"] for m in all_step_metrics]
+    G_effs = [m["G_eff"] for m in all_step_metrics if m.get("G_eff") is not None]
 
     step_summary = {
         "mean_escape_rate":   round(float(np.mean(escape_rates)), 4) if escape_rates else None,
-        "mean_active_bodies": round(float(np.mean(active_bodies)), 2) if active_bodies else None,
+        "mean_active_bodies": round(float(np.mean(active_bodies_list)), 2) if active_bodies_list else None,
         "mean_G_eff":         round(float(np.mean(G_effs)), 4) if G_effs else None,
     }
 
-    # Semantic coverage: fraction of universe bodies visited across all generated texts.
-    # Only meaningful when a universe is loaded.
     semantic_coverage: float | None = None
     if universe is not None:
-        coverages = []
-        for text in grav_texts:
-            token_ids = tokenizer.encode(text)
-            coverages.append(universe.semantic_coverage(token_ids))
+        coverages = [universe.semantic_coverage(tokenizer.encode(t)) for t in grav_texts]
         semantic_coverage = round(float(np.mean(coverages)), 4)
 
     grav_results = {
         "perplexity":           round(grav_ppl, 4),
         "distinct_1":           round(distinct_n(grav_texts, 1), 4),
         "distinct_2":           round(distinct_n(grav_texts, 2), 4),
+        "rep_rate_2":           round(repetition_rate(grav_texts, 2), 4),
         "avg_length":           round(avg_length(grav_texts), 2),
         "total_time_s":         round(grav_total_time, 3),
         "ms_per_token":         round(grav_total_time * 1000 / (grav_total_tokens + 1e-8), 2),
@@ -659,26 +1009,41 @@ def main() -> None:
         "texts":                grav_texts,
     }
 
-    # -------------------------------------------------------------------
-    # Assemble and save
-    # -------------------------------------------------------------------
+    # ── Save ──────────────────────────────────────────────────────────────
+    baselines_out = {"temperature": temp_result}
+    if topp_result:    baselines_out["top_p"]   = topp_result
+    if typical_result: baselines_out["typical"] = typical_result
+
     full_results = {
-        "config":        config,
-        "temperature":   temp_results,
-        "gravitational": grav_results,
+        "config": config, "baselines": baselines_out,
+        "gravitational": grav_results, "temperature": temp_result,
     }
+    (out_dir / "results.json").write_text(
+        json.dumps(full_results, indent=2, default=str))
+    (out_dir / "steps.json").write_text(
+        json.dumps(all_step_metrics, indent=2, default=str))
+    if all_diag:
+        (out_dir / "diagnostics.json").write_text(
+            json.dumps(all_diag, indent=2, default=str))
+        print(f"  Diagnostic data saved to {out_dir}/diagnostics.json")
 
-    (out_dir / "results.json").write_text(json.dumps(full_results, indent=2))
-    (out_dir / "steps.json").write_text(json.dumps(all_step_metrics, indent=2))
-
-    # Print summary
-    print_summary(full_results)
-
-    # Save text summary
+    print_summary({"config": config, "temperature": temp_result, "gravitational": grav_results})
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        print_summary(full_results)
+        print_summary({"config": config, "temperature": temp_result, "gravitational": grav_results})
     (out_dir / "summary.txt").write_text(buf.getvalue())
+
+    if topp_result or typical_result:
+        all_conds = [{**temp_result, "mean_escape_rate": None, "mean_active_bodies": None}]
+        if topp_result:    all_conds.append({**topp_result,    "mean_escape_rate": None, "mean_active_bodies": None})
+        if typical_result: all_conds.append({**typical_result, "mean_escape_rate": None, "mean_active_bodies": None})
+        all_conds.append({
+            **grav_results, "label": "gravitational",
+            "mean_escape_rate":    step_summary.get("mean_escape_rate"),
+            "mean_active_bodies":  step_summary.get("mean_active_bodies"),
+        })
+        print("\nBaseline comparison:")
+        print_ablation_table(all_conds)
 
     print(f"Results saved to {out_dir}/")
 
