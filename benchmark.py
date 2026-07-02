@@ -1046,3 +1046,10 @@ def main() -> None:
             "mean_active_bodies":  step_summary.get("mean_active_bodies"),
         })
         print("\nBaseline comparison:")
+        print_ablation_table(all_conds)
+
+    print(f"Results saved to {out_dir}/")
+
+
+if __name__ == "__main__":
+    main()
