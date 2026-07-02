@@ -15,7 +15,9 @@ Standard language model sampling controls output diversity through a scalar temp
 
 Large language models generate text by sampling from a probability distribution over the vocabulary at each step. The dominant approach to controlling this distribution is temperature scaling:
 
-$$p(x) = \text{softmax}(\mathbf{z} / T)$$
+```
+p(x) = softmax(z / T)
+```
 
 where **z** are the model's logits and T is a scalar temperature. At T = 1.0 the distribution is unchanged; T < 1.0 sharpens it toward the argmax; T > 1.0 flattens it toward uniform. Nucleus sampling (top-p) and top-k sampling further restrict sampling to high-probability mass.
 
@@ -61,16 +63,18 @@ At each generation step, the total gravitational force on each candidate token i
 
 The gravitational force exerted by a body on a candidate token is:
 
-$$F = G \cdot \frac{m_{\text{token}} \cdot m_{\text{body}}}{r^2}$$
+```
+F = G * (m_token * m_body) / r²
+```
 
 where:
 
 - **G** is the gravitational constant
-- **m_token** is the token's mass, derived from its embedding weight norm: $m = \lVert W[\text{token\_id}] \rVert / G$
+- **m_token** is the token's mass, derived from its embedding weight norm: `m = ‖W[token_id]‖ / G`
 - **m_body** is the body's mass, accumulated as tokens accrete onto its centroid
-- **r** is the cosine distance between the token's embedding and the body's centroid, floored at $r_{\min} = 0.1$ to prevent singularities
+- **r** is the cosine distance between the token's embedding and the body's centroid, floored at `r_min = 0.1` to prevent singularities
 
-The choice of cosine distance is natural for language model embeddings, which reside on a high-dimensional sphere where direction encodes semantic meaning and L2 magnitude encodes token frequency or model weighting. A floor of $r_{\min} = 0.1$ is essential: without it, tokens that belong to a body have cosine distances approaching zero, producing $F \propto G / 10^{-4}$ — forces several orders of magnitude larger than any reasonable gravitational field. Empirically, $r_{\min} = 10^{-6}$ caused complete diversity collapse (distinct-1 = 0.19) regardless of G value; $r_{\min} = 0.1$ restored expected behavior.
+The choice of cosine distance is natural for language model embeddings, which reside on a high-dimensional sphere where direction encodes semantic meaning and L2 magnitude encodes token frequency or model weighting. A floor of `r_min = 0.1` is essential: without it, tokens that belong to a body have cosine distances approaching zero, producing F ∝ G / 10⁻⁴ — forces several orders of magnitude larger than any reasonable gravitational field. Empirically, `r_min = 1e-6` caused complete diversity collapse (distinct-1 = 0.19) regardless of G value; `r_min = 0.1` restored expected behavior.
 
 Token mass derived from weight norms has a desirable property: it scales naturally with model size, making G transferable across model families. A token with a strong weight norm contributes more to body mass and receives more gravitational force — effectively weighting generation toward tokens the model considers important.
 
@@ -78,9 +82,9 @@ Token mass derived from weight norms has a desirable property: it scales natural
 
 A critical design decision is how gravitational forces modify the output distribution. Two options are available:
 
-**Additive (logit bias):** $\mathbf{z}' = \mathbf{z} + \alpha \cdot \mathbf{F}$  
+**Additive (logit bias):** `z' = z + α * F`
 
-**Multiplicative (probability scaling):** $p'(x) \propto p(x) \cdot (1 + F_x)$
+**Multiplicative (probability scaling):** `p'(x) ∝ p(x) * (1 + F_x)`
 
 I use the multiplicative form:
 
@@ -90,15 +94,17 @@ probs = probs × (1 + force_magnitudes)
 probs = probs / probs.sum()
 ```
 
-The reason is coherence preservation. Additive logit bias pushes tokens the model has assigned near-zero probability — for syntactic or factual reasons — into non-negligible sampling territory. Multiplicative reweighting preserves these hard constraints: a token with $p(x) \approx 0$ stays near zero regardless of gravitational pull. Gravity steers the distribution; the model still governs coherence. This is analogous to a gravitational field deflecting a trajectory rather than teleporting an object to a new location.
+The reason is coherence preservation. Additive logit bias pushes tokens the model has assigned near-zero probability — for syntactic or factual reasons — into non-negligible sampling territory. Multiplicative reweighting preserves these hard constraints: a token with p(x) ≈ 0 stays near zero regardless of gravitational pull. Gravity steers the distribution; the model still governs coherence. This is analogous to a gravitational field deflecting a trajectory rather than teleporting an object to a new location.
 
 ### 3.4 IDF Weighting
 
 Common tokens — articles, punctuation, EOS — are semantically non-specific. Gravitational amplification toward them would push generation toward grammatical filler rather than topically relevant content. I suppress this via inverse document frequency (IDF) weighting derived from the model's unconditional token distribution:
 
-$$\text{idf}(x) = -\log p_{\text{uncond}}(x)$$
+```
+idf(x) = -log p_uncond(x)
+```
 
-normalized to $[0, 1]$ across the vocabulary. IDF weighting is applied at two points:
+normalized to [0, 1] across the vocabulary. IDF weighting is applied at two points:
 
 1. **Body formation** — when a token accretes onto a DBSCAN cluster, its contribution to the body's mass is scaled by its IDF weight. Common tokens contribute minimally; rare, specific tokens contribute fully.
 
@@ -108,7 +114,7 @@ This makes the effective gravitational field a function of both semantic proximi
 
 ### 3.5 Escape Velocity
 
-Tokens whose total gravitational force falls below a threshold $\theta_{\text{esc}}$ are considered *unbound* — they contribute to the *escape rate*, the fraction of candidate tokens sampled at their base model probability without gravitational amplification. The escape rate is a diagnostic signal: it measures how tightly the field constrains sampling. A target escape rate near 0.7 means 70% of tokens are uninfluenced per step — gravity shapes the tail without overwhelming the base distribution.
+Tokens whose total gravitational force falls below a threshold `escape_threshold` are considered *unbound* — they contribute to the *escape rate*, the fraction of candidate tokens sampled at their base model probability without gravitational amplification. The escape rate is a diagnostic signal: it measures how tightly the field constrains sampling. A target escape rate near 0.7 means 70% of tokens are uninfluenced per step — gravity shapes the tail without overwhelming the base distribution.
 
 ---
 
@@ -118,7 +124,9 @@ Tokens whose total gravitational force falls below a threshold $\theta_{\text{es
 
 The total gravitational field is the sum of two independent layers:
 
-$$\mathbf{F}_{\text{total}} = \mathbf{F}_{\text{universe}} + \mathbf{F}_{\text{context}}$$
+```
+F_total = F_universe + F_context
+```
 
 This separation reflects a distinction between background semantic structure (present before any tokens are generated) and conversation-specific topical structure (emerging from the current generation).
 
@@ -126,9 +134,9 @@ This separation reflects a distinction between background semantic structure (pr
 
 The universe is a pre-computed set of semantic bodies derived from k-means clustering of the full model vocabulary:
 
-1. Extract the model's input embedding matrix $\mathbf{E} \in \mathbb{R}^{|V| \times D}$.
+1. Extract the model's input embedding matrix E of shape [vocab_size, D].
 2. L2-normalize each row so k-means minimizes cosine distance.
-3. Run MiniBatchKMeans to find $n = 256$ cluster centroids.
+3. Run MiniBatchKMeans to find n = 256 cluster centroids.
 4. Assign a gravitational mass to each cluster.
 
 Three mass schemes are supported. *Uniform* assigns equal mass to all bodies, providing a flat background boost to rare tokens. *Size* sets mass proportional to cluster population — denser semantic regions exert more force. *IDF* sets mass as the mean IDF weight of member tokens, so clusters of semantically specific vocabulary outweigh clusters of common words. IDF is the default and consistently outperforms the alternatives in my benchmarks.
@@ -143,9 +151,11 @@ A naive universe field is omnidirectional — all bodies exert force at every st
 
 I introduce *context-affinity modulation*: each universe body's effective mass is weighted by its cosine similarity to the current orbital position (the recent context embedding):
 
-$$\tilde{m}_i = m_i \cdot \max(0,\ \hat{\mathbf{c}}_i \cdot \hat{\mathbf{p}})$$
+```
+effective_mass[i] = mass[i] * max(0, cosine_similarity(centroid[i], context_position))
+```
 
-where $\hat{\mathbf{c}}_i$ is the L2-normalized centroid of body $i$ and $\hat{\mathbf{p}}$ is the L2-normalized current context position. Bodies semantically close to the current context exert full force; bodies far away contribute near zero. This makes the universe field context-sensitive without making it adaptive — the centroids and base masses are fixed; only the effective masses vary per step.
+where `centroid[i]` and `context_position` are both L2-normalized. Bodies semantically close to the current context exert full force; bodies far away contribute near zero. This makes the universe field context-sensitive without making it adaptive — the centroids and base masses are fixed; only the effective masses vary per step.
 
 Empirically, context-affinity modulation improved distinct-1 from approximately 0.44 (temperature baseline) to 0.53–0.57.
 
@@ -153,7 +163,7 @@ Empirically, context-affinity modulation improved distinct-1 from approximately 
 
 When local body formation is enabled, an IncrementalDBSCAN clustering runs over prompt and generated tokens, building conversation-specific bodies in real time. Bodies form when a cluster accumulates sufficient tokens, grow as new related tokens accrete, and merge when two bodies come within a collision threshold.
 
-The local field provides prompt-specific gravitational perturbation on top of the universe field. It is particularly useful for domain-specific generation where a few strong topics dominate the conversation. However, it is more sensitive to parameter choices — specifically the $r_{\min}$ floor and force normalization — and should be used with fixed G or AdaptiveG targeted at a realistic escape rate.
+The local field provides prompt-specific gravitational perturbation on top of the universe field. It is particularly useful for domain-specific generation where a few strong topics dominate the conversation. However, it is more sensitive to parameter choices — specifically the `r_min` floor and force normalization — and should be used with fixed G or AdaptiveG targeted at a realistic escape rate.
 
 Force from local bodies is normalized by the number of active bodies to maintain scale parity with the universe field. Without this normalization, two local bodies would exert forces comparable to the entire 256-body universe field.
 
@@ -162,9 +172,9 @@ Force from local bodies is normalized by the number of active bodies to maintain
 The context vector maintains a trajectory through embedding space:
 
 - **Position** — L2-normalized mean of recent token embeddings
-- **Velocity** — change in position per token: $\mathbf{v}_t = \mathbf{p}_t - \mathbf{p}_{t-1}$
-- **Acceleration** — change in velocity per token: $\mathbf{a}_t = \mathbf{v}_t - \mathbf{v}_{t-1}$
-- **Momentum** — scalar magnitude $\lVert \mathbf{v}_t \rVert$: resistance to gravitational deflection
+- **Velocity** — change in position per token: `v[t] = p[t] - p[t-1]`
+- **Acceleration** — change in velocity per token: `a[t] = v[t] - v[t-1]`
+- **Momentum** — scalar magnitude `‖v[t]‖`: resistance to gravitational deflection
 
 High-momentum trajectories resist deflection from new bodies; sudden acceleration indicates a topic shift. This state is used both for context-affinity modulation and as a diagnostic signal for tracking semantic drift.
 
@@ -180,7 +190,7 @@ Bodies progress through a defined lifecycle:
 
 **Persistence.** When a body's stability score exceeds a threshold, it is written to `ContextBodyStore`. Stability is derived from cluster compactness and mass.
 
-**Decay.** Stored bodies lose mass at rate $\lambda \cdot \Delta t$. Bodies falling below an extinction threshold are deleted.
+**Decay.** Stored bodies lose mass at rate `decay_rate × elapsed_seconds`. Bodies falling below an extinction threshold are deleted.
 
 **Re-emergence.** If a new body forms within `reemergence_distance` of a dormant (low-mass) stored body, the stored body is re-energized rather than a duplicate being created.
 
@@ -200,17 +210,22 @@ Body type emerges from mass rather than being assigned:
 
 The gravitational constant G can be held fixed or managed by AdaptiveG, a PI controller that adjusts G per step via three multiplicative terms:
 
-$$G_{\text{eff}}(t) = G_{\text{base}} \cdot \mu_{\text{mass}}(t) \cdot \mu_{\text{escape}}(t) \cdot \mu_{\text{domain}}$$
+```
+G_eff(t) = G_base × mass_norm(t) × escape_feedback(t) × domain_scale
+```
 
-**Mass normalization** ($\mu_{\text{mass}}$): body mass grows as tokens accrete. Without compensation, a mature body late in a long generation exerts orders of magnitude more force than the same body 50 tokens earlier. $\mu_{\text{mass}}$ tracks an exponential moving average of active body mass and scales G inversely, keeping expected force magnitude stable throughout generation.
+**Mass normalization** (`mass_norm`): body mass grows as tokens accrete. Without compensation, a mature body late in a long generation exerts orders of magnitude more force than the same body 50 tokens earlier. `mass_norm` tracks an exponential moving average of active body mass and scales G inversely, keeping expected force magnitude stable throughout generation.
 
-**Escape rate feedback** ($\mu_{\text{escape}}$): a PI controller targets a configurable escape rate $\hat{r}$:
+**Escape rate feedback** (`escape_feedback`): a PI controller targets a configurable escape rate `r_target`:
 
-$$\text{error}(t) = \hat{r} - r_t, \quad \mu_{\text{escape}}(t) = \text{clip}(1 + K_p \cdot \text{error}(t) + K_i \cdot \bar{\text{error}},\ G_{\min},\ G_{\max})$$
+```
+error(t)          = r_target - r_observed(t)
+escape_feedback   = clip(1 + Kp * error(t) + Ki * mean(error_history), G_min, G_max)
+```
 
-**Domain multiplier** ($\mu_{\text{domain}}$): a static per-domain scalar applied after the feedback terms. Code, medical, and legal domains benefit from higher G (tighter topical constraint); creative tasks from lower G (more exploration).
+**Domain multiplier** (`domain_scale`): a static per-domain scalar applied after the feedback terms. Code, medical, and legal domains benefit from higher G (tighter topical constraint); creative tasks from lower G (more exploration).
 
-**Practical limitation.** In universe-only mode, the escape rate stabilizes near 0.15 regardless of G. Approximately 15% of tokens escape because IDF weighting suppresses their effective force below $\theta_{\text{esc}}$ — they are high-frequency tokens that should be unaffected by gravity. The remaining 85% have sufficient IDF weight to remain bound at any G. AdaptiveG targeting an escape rate of 0.7 cannot converge in this mode. The escape rate of 0.15 is correct behavior, not a sign that G is too high. I recommend AdaptiveG only when local bodies are also enabled; for universe-only generation, fixed G suffices.
+**Practical limitation.** In universe-only mode, the escape rate stabilizes near 0.15 regardless of G. Approximately 15% of tokens escape because IDF weighting suppresses their effective force below `escape_threshold` — they are high-frequency tokens that should be unaffected by gravity. The remaining 85% have sufficient IDF weight to remain bound at any G. AdaptiveG targeting an escape rate of 0.7 cannot converge in this mode. The escape rate of 0.15 is correct behavior, not a sign that G is too high. I recommend AdaptiveG only when local bodies are also enabled; for universe-only generation, fixed G suffices.
 
 ### 4.8 G Split
 
@@ -225,7 +240,7 @@ The two are mutually exclusive in the CLI: `--G-local` and `--adaptive-g` cannot
 
 ### 4.9 Persistent Store and Cross-Session Memory
 
-`ContextBodyStore` wraps a `VectorBackend` protocol with three additional behaviors: deduplication before insertion, gravitational ranking of query results (by $m / r^2$ rather than raw cosine similarity), and time-based mass decay. Swapping backends — FAISS in-memory, Qdrant on-disk, Pinecone, pgvector — requires no changes to the sampler.
+`ContextBodyStore` wraps a `VectorBackend` protocol with three additional behaviors: deduplication before insertion, gravitational ranking of query results (by `mass / r²` rather than raw cosine similarity), and time-based mass decay. Swapping backends — FAISS in-memory, Qdrant on-disk, Pinecone, pgvector — requires no changes to the sampler.
 
 Stable bodies written to the store persist across conversations. When a new session begins, the store's bodies load into the active field as background perturbations alongside the universe field. Over many sessions in a domain-specific context, the store accumulates a living knowledge graph of the semantic structure relevant to that context: clusters that appeared repeatedly gain mass; clusters that were one-off mentions decay. The gravitational field at the start of each new conversation reflects the full semantic history of prior ones.
 
@@ -235,7 +250,7 @@ Stable bodies written to the store persist across conversations. When a new sess
 
 ### 5.1 Setup
 
-I benchmark on GPT-2 (117M) and GPT-2 Medium (345M) using five diverse prompts (100 tokens each, 2 runs per prompt, results averaged). The temperature baseline uses T = 0.8 without top-p or top-k. All gravitational configurations use the IDF mass scheme for the universe field and $r_{\min} = 0.1$.
+I benchmark on GPT-2 (117M) and GPT-2 Medium (345M) using five diverse prompts (100 tokens each, 2 runs per prompt, results averaged). The temperature baseline uses T = 0.8 without top-p or top-k. All gravitational configurations use the IDF mass scheme for the universe field and `r_min = 0.1`.
 
 **Metrics:**
 
@@ -263,7 +278,7 @@ All universe configurations substantially improve distinct-1 over the temperatur
 
 ### 5.4 Universe + Local Bodies — Effect of r_min
 
-An early implementation used $r_{\min} = 10^{-6}$ for local body force computation. Results showed complete diversity collapse:
+An early implementation used `r_min = 1e-6` for local body force computation. Results showed complete diversity collapse:
 
 | Mode | ppl | distinct-1 | note |
 |---|---|---|---|
@@ -271,9 +286,9 @@ An early implementation used $r_{\min} = 10^{-6}$ for local body force computati
 | G_local = 0.1, fixed | 5.89 | 0.1893 | collapse at any G |
 | AdaptiveG | 7.05 | 0.2463 | partial recovery |
 
-Root cause: with $r_{\min} = 10^{-6}$, tokens belonging to a local body have $r \approx 10^{-3}$, yielding $F \propto G \cdot m / 10^{-6}$ — forces $10^6$ times larger than any universe body force. The local field completely dominated, collapsing sampling to a handful of tokens regardless of G. Distinct-1 was insensitive to G value because the singularity saturated the force computation at every setting.
+Root cause: with `r_min = 1e-6`, tokens belonging to a local body have r ≈ 0.001, yielding F ∝ G * m / 1e-6 — forces 10⁶ times larger than any universe body force. The local field completely dominated, collapsing sampling to a handful of tokens regardless of G. Distinct-1 was insensitive to G value because the singularity saturated the force computation at every setting.
 
-After setting $r_{\min} = 0.1$ and adding per-body normalization:
+After setting `r_min = 0.1` and adding per-body normalization:
 
 | Mode | ppl | distinct-1 | active bodies |
 |---|---|---|---|
@@ -288,7 +303,9 @@ Removing IDF weighting slightly reduces perplexity but also slightly reduces div
 
 GPT-2 Medium (768-dimensional embeddings) initially ran at 637 ms/token for local body force computation due to serial numpy dot products over each active body. Porting the inner loop to a single batched matrix multiplication on GPU:
 
-$$\text{cos\_sims} = \mathbf{E}_{\text{norm}} \cdot \mathbf{C}_{\text{norm}}^{\top} \in \mathbb{R}^{|V| \times n_{\text{bodies}}}$$
+```
+cos_sims = E_norm @ C_norm.T   # [vocab_size, n_bodies]
+```
 
 reduced this to 124 ms/token — a 5× speedup — while also yielding a slight perplexity improvement, likely from float32 precision on GPU.
 
@@ -388,7 +405,7 @@ The framework raises a question that standard sampling cannot: not "how likely i
 | Escape velocity / escape rate | Fraction of tokens sampled without gravitational influence |
 | Orbital position | Normalized mean of recent context embeddings |
 | Velocity | Change in context position per token |
-| Momentum | $\lVert \mathbf{v}_t \rVert$ — resistance to topical deflection |
+| Momentum | `‖v[t]‖` — resistance to topical deflection |
 | Inelastic collision | Mass-weighted centroid merge of nearby bodies |
 | Universe | Background field from vocabulary-wide clustering |
 | Context bodies | Prompt-specific perturbations on the universe field |
