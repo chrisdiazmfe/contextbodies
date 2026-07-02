@@ -246,6 +246,7 @@ def generate_gravitational(
     sampler: GravitationalSampler,
     device: str,
     collect_diagnostics: bool = False,
+    temperature: float = 1.0,
 ) -> "tuple[str, float, list[StepMetrics], list[dict]]":
     """
     Gravitational sampling with per-step metric collection.
@@ -285,7 +286,7 @@ def generate_gravitational(
             logits = outputs.logits[0, -1, :]
 
             next_token = sampler.sample(
-                logits=logits,
+                logits=logits / temperature,
                 token_embeddings=token_embeddings,
             )
             latency_ms = (time.perf_counter() - t0) * 1000
@@ -599,6 +600,7 @@ def _run_one_condition(
                 sampler=sampler,
                 device=device,
                 collect_diagnostics=do_diag,
+                temperature=args.temperature,
             )
 
             gen_only = text[len(prompt):]
@@ -963,6 +965,7 @@ def main() -> None:
             text, elapsed, step_mets, diag_data = generate_gravitational(
                 model, tokenizer, prompt, max_tokens=args.max_tokens,
                 sampler=sampler, device=device, collect_diagnostics=do_diag,
+                temperature=args.temperature,
             )
 
             gen_only = text[len(prompt):]
@@ -1043,10 +1046,3 @@ def main() -> None:
             "mean_active_bodies":  step_summary.get("mean_active_bodies"),
         })
         print("\nBaseline comparison:")
-        print_ablation_table(all_conds)
-
-    print(f"Results saved to {out_dir}/")
-
-
-if __name__ == "__main__":
-    main()

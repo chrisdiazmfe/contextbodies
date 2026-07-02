@@ -620,11 +620,14 @@ class GravitationalSampler:
         # reflects what's semantically nearby right now, not a fixed rare-token
         # boost. Bodies far from the current context contribute almost nothing.
         if self.universe is not None:
-            context_pos = (
-                self.orbital_state.position
-                if self.orbital_state is not None
-                else None
-            )
+            # Only use orbital position for context-affinity modulation once
+            # it has been updated (norm > 0.1); pass None before then so the
+            # universe field is applied at full strength from the first step.
+            context_pos = None
+            if self.orbital_state is not None:
+                pos = self.orbital_state.position
+                if np.linalg.norm(pos) > 0.1:
+                    context_pos = pos
             if self._cached_token_embs_norm_torch is not None:
                 force_magnitudes += self.universe.compute_field_torch(
                     self._cached_token_embs_norm_torch, self.G_universe, token_mass,
