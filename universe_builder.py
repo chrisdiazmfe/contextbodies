@@ -47,21 +47,39 @@ class Universe:
     # Force computation
     # ------------------------------------------------------------------
 
-    def compute_field(self, embs_norm, G, token_mass=1.0, context_pos=None):
+    def compute_field(self, embs_norm, G, token_mass=1.0, context_pos=None,
+                      top_k_bodies: int = 16):
         """Numpy/CPU path. Prefer compute_field_torch when GPU is available."""
         cos_sims = embs_norm @ self._centroids_norm.T   # [vocab, n_bodies]
         r = np.maximum(1.0 - cos_sims, 0.1)
         if context_pos is not None:
             ctx_norm = context_pos / (np.linalg.norm(context_pos) + 1e-8)
             affinities = np.maximum(self._centroids_norm @ ctx_norm, 0.0)
+            k = min(top_k_bodies, self.n_bodies)
+            if k < self.n_bodies:
+                topk_idx = np.argpartition(affinities, -k)[-k:]
+                mask = np.zeros(self.n_bodies, dtype=np.float32)
+                mask[topk_idx] = 1.0
+                affinities = affinities * mask
         else:
             affinities = np.ones(self.n_bodies, dtype=np.float32)
         effective_masses = self.masses * affinities
         forces = G * token_mass * effective_masses / (r ** 2)
-        return forces.sum(axis=1) / self.n_bodies
+        k_active = min(top_k_bodies, self.n_bodies)
+        return forces.sum(axis=1) / k_active
 
-    def compute_field_torch(self, embs_norm, G, token_mass=1.0, context_pos=None):
-        """GPU-accelerated field computation. Returns CPU numpy array [vocab_size]."""
+    def compute_field_torch(self, embs_norm, G, token_mass=1.0, context_pos=None,
+                            top_k_bodies: int = 16):
+        """
+        GPU-accelerated field computation. Returns CPU numpy array [vocab_size].
+
+        top_k_bodies : int
+            Only the top-k bodies most aligned with the current context contribute
+            force. Concentrating force on relevant bodies makes the semantic
+            geometry meaningful — random/shuffled centroids will align with
+            different (less relevant) bodies and diverge from the real universe.
+            Set to n_bodies to use all bodies (old behaviour).
+        """
         device = embs_norm.device
         dtype = embs_norm.dtype
         if (
@@ -74,17 +92,33 @@ class Universe:
             self._torch_device = str(device)
             self._torch_dtype = str(dtype)
         with torch.no_grad():
-            cos_sims = embs_norm @ self._torch_centroids.T
+            cos_sims = embs_norm @ self._torch_centroids.T   # [vocab, n_bodies]
             r = torch.clamp(1.0 - cos_sims, min=0.1)
+
             if context_pos is not None:
                 ctx_norm = context_pos / (np.linalg.norm(context_pos) + 1e-8)
                 ctx_t = torch.tensor(ctx_norm, dtype=dtype, device=device)
-                affinities = torch.clamp(self._torch_centroids @ ctx_t, min=0.0)
+                affinities = torch.clamp(self._torch_centroids @ ctx_t, min=0.0)  # [n_bodies]
+
+                # Concentrate force on the top-k most contextually relevant bodies.
+                # This is the key change: with all bodies active, the force field is
+                # nearly uniform (shuffled ≈ real). With top-k, only semantically
+                # aligned bodies contribute — so geometry matters.
+                k = min(top_k_bodies, self.n_bodies)
+                if k < self.n_bodies:
+                    topk_vals, topk_idx = torch.topk(affinities, k=k)
+                    mask = torch.zeros(self.n_bodies, dtype=dtype, device=device)
+                    mask[topk_idx] = 1.0
+                    affinities = affinities * mask
             else:
                 affinities = torch.ones(self.n_bodies, dtype=dtype, device=device)
+
             effective_masses = self._torch_masses * affinities
             forces = G * token_mass * effective_masses / (r ** 2)
-            field = forces.sum(dim=1) / self.n_bodies
+            # Normalise by k (active bodies) not n_bodies so force scale is
+            # consistent regardless of how many bodies are selected.
+            k_active = min(top_k_bodies, self.n_bodies)
+            field = forces.sum(dim=1) / k_active
         return field.cpu().numpy()
 
     # ------------------------------------------------------------------

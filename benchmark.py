@@ -490,6 +490,11 @@ def parse_args() -> argparse.Namespace:
                    choices=["uniform", "size", "idf"],
                    help="Mass scheme for universe bodies: uniform, size (cluster size), "
                         "or idf (mean IDF weight of member tokens). Default: idf.")
+    p.add_argument("--universe-top-k", type=int, default=16, dest="universe_top_k",
+                   help="Number of top contextually-aligned universe bodies to apply force "
+                        "from (default: 16). Lower values concentrate force on fewer, more "
+                        "relevant bodies, making semantic geometry matter more. "
+                        "Set to 256 (n_clusters) to use all bodies.")
     # Context body layer
     p.add_argument("--local-bodies", action="store_true",
                    help="Enable the local context body layer (DBSCAN clustering of "
@@ -589,6 +594,7 @@ def _run_one_condition(
                 cluster_radius=args.cluster_radius,
                 cluster_min_tokens=args.cluster_min_tokens,
             )
+            sampler.universe_top_k_bodies = args.universe_top_k
             sampler._idf_weights = idf_weights if use_idf else None
             if collect_diagnostics and i == 0 and run == 0:
                 sampler.set_tokenizer(tokenizer)

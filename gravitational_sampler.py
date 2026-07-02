@@ -628,15 +628,16 @@ class GravitationalSampler:
                 pos = self.orbital_state.position
                 if np.linalg.norm(pos) > 0.1:
                     context_pos = pos
+            top_k = getattr(self, "universe_top_k_bodies", 16)
             if self._cached_token_embs_norm_torch is not None:
                 force_magnitudes += self.universe.compute_field_torch(
                     self._cached_token_embs_norm_torch, self.G_universe, token_mass,
-                    context_pos=context_pos,
+                    context_pos=context_pos, top_k_bodies=top_k,
                 )
             else:
                 force_magnitudes += self.universe.compute_field(
                     embs_norm, self.G_universe, token_mass,
-                    context_pos=context_pos,
+                    context_pos=context_pos, top_k_bodies=top_k,
                 )
 
         # Apply IDF to the output field so common tokens (EOS, articles,
