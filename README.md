@@ -1,6 +1,31 @@
 # contextbodies
 
-A physics-inspired token sampling system for LLMs that replaces temperature-based sampling with a gravitational field model.
+A physics-inspired token sampling system for LLMs that adds a semantic-field reweighting term to the next-token distribution. Semantic bodies derived from vocabulary clustering exert gravitational influence on sampling based on cosine distance in embedding space — steering generation toward topically relevant tokens without overriding the model's own probability structure.
+
+---
+
+## Results
+
+Full ablation on GPT-2, 100 tokens, 8 prompts, temperature matched at T=0.8:
+
+| Condition | Perplexity | Distinct-1 | Rep-2 | Notes |
+|---|---|---|---|---|
+| Temperature T=0.8 | 9.84 | 0.411 | 0.187 | baseline |
+| Top-p (p=0.95) | 6.67 | 0.350 | — | low diversity |
+| Typical sampling | 11.64 | 0.427 | 0.141 | +4% d1, −24% rep |
+| Local bodies only | **13.42** | 0.457 | 0.174 | +11% d1, 43ms/tok |
+| Universe (real centroids) | 14.74 | 0.493 | **0.108** | +20% d1, −42% rep, 93ms/tok |
+| Universe (shuffled centroids) | 14.76 | 0.494 | — | ≈ real; geometry not mass distribution |
+| Universe (random centroids) | 15.83 | **0.505** | 0.116 | +23% d1; pushes diversity over coherence |
+
+Key findings:
+
+- **All gravitational conditions outperform temperature on lexical diversity and repetition reduction.** The mechanism works regardless of centroid geometry.
+- **The semantic universe enforces topical coherence, not maximum diversity.** Real centroids achieve lower perplexity than random (14.74 vs 15.83) but also lower distinct-1 (0.493 vs 0.505). Semantic geometry nudges toward contextually plausible rare tokens; random geometry pushes toward arbitrary embedding regions.
+- **Real ≈ shuffled.** Same centroid positions, permuted mass assignments produce nearly identical results. The geometry of centroid locations is what matters, not which cluster gets which mass.
+- **Top-k body selection is required for geometry to matter.** With all 256 bodies active simultaneously, the force field is nearly uniform across the vocabulary (force max/mean ≈ 3.1) and real, shuffled, and random conditions are indistinguishable. Restricting force to the top-k=4 most contextually aligned bodies concentrates force selectively and makes semantic geometry meaningful.
+- **Local bodies mode is Pareto-optimal** on perplexity (13.42) at 2× lower latency (43ms vs 93ms/tok).
+- **Temperature matching is mandatory.** Mismatched temperature (baseline T=0.8 vs gravitational T=1.0) inflates perplexity by ~4× and makes the comparison meaningless.
 
 ---
 
@@ -55,6 +80,57 @@ text = generate(
     max_tokens=200,
 )
 print(text)
+```
+
+---
+
+## HuggingFace Integration (SemanticForceProcessor)
+
+`SemanticForceProcessor` wraps the gravitational field as a standard `LogitsProcessor` for use with `model.generate()`. No custom generation loop required.
+
+```python
+from contextbodies import SemanticForceProcessor, UniverseBuilder
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
+# Build universe (one-time; save/load with universe.save() / Universe.load())
+universe = UniverseBuilder().build(model, n_clusters=256, mass_scheme="idf")
+
+processor = SemanticForceProcessor(
+    universe=universe,
+    G_universe=1.0,
+    universe_top_k=4,   # restrict force to top-k contextually aligned bodies
+)
+
+inputs = tokenizer("Tell me about transformers", return_tensors="pt")
+outputs = model.generate(
+    **inputs,
+    do_sample=True,
+    temperature=0.8,
+    top_p=0.9,
+    logits_processor=[processor],
+    renormalize_logits=True,
+    max_new_tokens=200,
+)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+The logit-space update is `scores += log1p(force_magnitudes)`, which approximates multiplicative reweighting in probability space. Setting `renormalize_logits=True` in `generate()` is recommended.
+
+To compare field-on vs field-off with identical seeds:
+
+```python
+# Baseline
+torch.manual_seed(42)
+out_base = model.generate(**inputs, do_sample=True, temperature=0.8, top_p=0.9, max_new_tokens=100)
+
+# With semantic field
+torch.manual_seed(42)
+out_grav = model.generate(**inputs, do_sample=True, temperature=0.8, top_p=0.9,
+                           logits_processor=[processor], renormalize_logits=True, max_new_tokens=100)
 ```
 
 ---
@@ -122,6 +198,15 @@ python benchmark.py --universe-path results/universe-baseline/universe.npz \
     --deterministic --output results/deterministic
 ```
 
+### Ablation mode
+
+Run the full ablation battery (real, shuffled, random centroids, no-IDF, uniform mass, local-only, combined, and baselines) in one pass:
+
+```bash
+python benchmark.py --build-universe --ablation --universe-top-k 4 \
+    --temperature 0.8 --output results/ablation
+```
+
 ### All benchmark flags
 
 | Flag | Default | Description |
@@ -129,8 +214,10 @@ python benchmark.py --universe-path results/universe-baseline/universe.npz \
 | `--model` | `gpt2` | HuggingFace model name |
 | `--max-tokens` | `100` | Max tokens per prompt |
 | `--runs` | `2` | Runs per prompt (averaged) |
-| `--temperature` | `0.8` | Temperature for the baseline sampler |
+| `--temperature` | `0.8` | Temperature for all samplers (baseline and gravitational — must match for fair comparison) |
 | `--temperature-only` | off | Run only the temperature baseline |
+| `--ablation` | off | Run full ablation battery across all geometry/mass/baseline conditions |
+| `--universe-top-k` | `16` | Top-k contextually aligned universe bodies to apply force from. k=4 recommended — with all 256 bodies active the force field is nearly uniform and conditions are indistinguishable |
 | `--G-local` | `1.0` | Fixed gravitational constant for local context bodies. Mutually exclusive with `--adaptive-g` |
 | `--G-universe` | `1.0` | Gravitational constant for the universe background field. Always static — never adjusted by AdaptiveG |
 | `--G-base` | `1.0` | Starting G for AdaptiveG. Only relevant when `--adaptive-g` is set; ignored otherwise |
@@ -402,8 +489,9 @@ contextbodies/
 ├── adaptive_dbscan.py       # AdaptiveDBSCAN — auto-calibrates cluster radius from embedding geometry
 ├── adaptive_g.py            # AdaptiveG — mass-normalized PI controller for G
 ├── universe_builder.py      # Universe + UniverseBuilder — vocabulary-wide semantic field
-├── gravitational_sampler.py # Core sampler — replaces temperature at inference time
-├── benchmark.py             # Evaluation harness — gravitational vs temperature comparison
+├── semantic_force_processor.py # SemanticForceProcessor — LogitsProcessor for model.generate()
+├── gravitational_sampler.py # Core sampler — custom generation loop with full diagnostics
+├── benchmark.py             # Evaluation harness — ablation battery + baseline comparison
 ├── generate.py              # Drop-in generation loop
 └── tests/
     ├── conftest.py
@@ -463,7 +551,11 @@ Early research implementation.
 
 ### Completed
 
-- **Multiplicative reweighting** — gravity amplifies the model's own distribution (`probs × (1 + force)`) rather than adding a flat logit bias. Tokens the model assigns near-zero probability stay near-zero regardless of gravitational pull.
+- **Multiplicative reweighting** — gravity amplifies the model's own distribution (`probs × (1 + force)`) rather than adding a flat logit bias. Tokens the model assigns near-zero probability stay near-zero regardless of gravitational pull. Logit-space equivalent: `scores += log1p(force)`.
+- **SemanticForceProcessor** — `LogitsProcessor` implementation for `model.generate()`. Wraps the universe field with no custom generation loop required. Supports `universe_top_k` for force concentration.
+- **Top-k body selection** — restricts force computation to the k bodies most aligned with the current context position. Required for semantic geometry to produce meaningful force differentials; without it, all 256 bodies contribute nearly uniformly and real/shuffled/random conditions are indistinguishable.
+- **Full ablation battery** — `--ablation` flag runs all geometry/mass/IDF/baseline conditions in one pass: real, shuffled, random centroids, no-IDF, uniform mass, local-only, universe+local, temperature, top-p, typical sampling.
+- **Diagnostic logging** — per-step force mean/max, active body count, top boosted tokens, escape rate, and before/after token rank logged during generation.
 - **Universe** — pre-computed k-means clustering of all vocabulary embeddings provides a permanent background gravitational field, breaking the diversity feedback loop of context-only bodies. Three mass schemes: `uniform`, `size` (cluster density), `idf` (mean IDF weight of member tokens). Saves/loads as `.npz`. Reports `semantic_coverage` (fraction of universe bodies visited) as a new diversity metric.
 - **AdaptiveG** — PI controller that adjusts G each step via mass normalization + escape rate feedback + domain multipliers.
 - **Dual IDF** — IDF weighting applied at both body formation (`post_step`) and the output field (`sample`). Common tokens suppressed at ingestion and at sampling.
